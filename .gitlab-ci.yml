@@ -1,13 +1,126 @@
-# You can override the included template(s) by including variable overrides
-# SAST customization: https://docs.gitlab.com/ee/user/application_security/sast/#customizing-the-sast-settings
-# Secret Detection customization: https://docs.gitlab.com/ee/user/application_security/secret_detection/pipeline/#customization
-# Dependency Scanning customization: https://docs.gitlab.com/ee/user/application_security/dependency_scanning/#customizing-the-dependency-scanning-settings
-# Container Scanning customization: https://docs.gitlab.com/ee/user/application_security/container_scanning/#customizing-the-container-scanning-settings
-# Note that environment variables can be set in several places
-# See https://docs.gitlab.com/ee/ci/variables/#cicd-variable-precedence
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ==============================================================================
+# Default pipeline configuration
+# ==============================================================================
+default:
+  interruptible: true
+  # Only retry on GitLab failures (not on script failures for example)
+  retry:
+    max: 2
+    when:
+      - api_failure
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - scheduler_failure
+      - unknown_failure
+
+variables:
+  UV_VERSION: 0.5
+  PYTHON_VERSION: 3.12
+  BASE_LAYER: bookworm-slim
+  UV_LINK_MODE: copy
+
+workflow:
+  rules:
+    - if: $CI_PROJECT_ROOT_NAMESPACE != "omniverse" # Prevent pipelines that can't access the runners
+      when: never
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_SHA
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      auto_cancel:
+        on_new_commit: none
+        on_job_failure: none
+    - if: $CI_COMMIT_TAG # Run for tagged releases
+    - if: $CI_COMMIT_BRANCH =~ /^release-.*/
+    - if: $CI_PIPELINE_SOURCE == "web" # Run if triggered from the UI
+
 stages:
-- test
-sast:
-  stage: test
+  - lint
+  - test
+  - build
+
+# ==============================================================================
+# Include the Omniverse DevPlat runner job definitions
+# ==============================================================================
 include:
-- template: Security/SAST.gitlab-ci.yml
+  - project: "omniverse/devplat/gitlab/templates/runners"
+    file: "/modules/include.yml"
+    ref: v1_latest
+
+# --- Stage: Lint ---
+linting:
+  stage: lint
+  image: ghcr.io/astral-sh/uv:bookworm
+  extends:
+    - .runner-utility-linux-x86_64
+  before_script:
+    - uv venv
+  script:
+    - uvx pre-commit run --all-files --show-diff-on-failure
+
+# --- Stage: Test ---
+testing:
+  stage: test
+  image: ghcr.io/astral-sh/uv:bookworm
+  extends:
+    - .omni_nvks_gpu
+  before_script:
+    - echo -e "\\e[0Ksection_start:`date +%s`:install_dependencies[collapsed=true]\\r\\e[0KInstalling dependencies"
+    - uv venv
+    - uv pip install .[mujoco,tests]
+    - echo -e "\\e[0Ksection_end:`date +%s`:install_dependencies\\r\\e[0K"
+  script:
+    - uv run -m newton.tests --junit-report-xml rspec.xml --coverage --coverage-xml coverage.xml --failfast
+  coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
+  artifacts:
+    when: always
+    paths:
+      - rspec.xml
+      - coverage.xml
+    reports:
+      junit: rspec.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH =~ /^release-.*/
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      changes:
+        - .gitlab/ci/*
+        - .gitlab-ci.yml
+        - newton/**/*
+        - pyproject.toml
+        - .python-version
+        - uv.lock
+    - when: manual # If not auto-triggered, allow any pipeline to run this job manually
+      allow_failure: true
+
+# --- Stage: Build ---
+build_package:
+  stage: build
+  image: ghcr.io/astral-sh/uv:bookworm
+  extends:
+    - .runner-utility-linux-x86_64
+  script:
+    - uv build --wheel
+    - uvx twine check dist/*
+  artifacts:
+    paths:
+      - dist/

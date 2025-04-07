@@ -1,0 +1,93 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "newton-physics"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["warp-lang>=1.7.0.dev20250326"]
+
+[project.optional-dependencies]
+dev = ["pre-commit"]
+docs = ["sphinx", "furo"]
+mujoco = ["mujoco-warp"]
+tests = ["coverage[toml]", "usd-core"]
+all = ["newton-physics[dev,docs,mujoco,tests]"]
+
+[tool.setuptools]
+include-package-data = false # Explicitly disable automatic data inclusion
+
+[tool.setuptools.packages.find]
+exclude = ["newton.licenses*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+newton = ["licenses/**/*"]
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+
+[tool.uv.sources]
+mujoco-warp = { git = "https://github.com/google-deepmind/mujoco_warp" }
+warp-lang = { index = "nvidia", marker = "sys_platform != 'darwin'" }
+
+[tool.ruff]
+cache-dir = ".cache/ruff"
+line-length = 120
+indent-width = 4
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "I",   # isort
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "NPY", # NumPy-specific rules
+    "PLC", # pylint convention
+    "PLE", # pylint error
+    "PLW", # pylint warning
+    "UP",  # pyupgrade
+    "RUF", # ruff-specific rules
+]
+ignore = [
+    "E501",   # Many lines are over 120 characters already (TODO: Fix)
+    "E741",   # Warp often uses l as a variable name
+    "UP018",  # Warp kernels often use float(val) and int(val)
+    "RUF046", # Warp kernels often use int(val)
+    "F811",   # Allow Warp kernel/function overloads
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+docstring-code-format = true
+
+[tool.coverage.run]
+source = ["newton"]
+disable_warnings = [
+    "module-not-measured",
+    "module-not-imported",
+    "no-data-collected",
+    "couldnt-parse",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "@wp",
+    "@warp",
+    "if 0:",
+    "if __name__ == .__main__.:",
+]
+omit = ["*/newton/examples/*", "*/newton/tests/*", "/newton/thirdparty/*"]

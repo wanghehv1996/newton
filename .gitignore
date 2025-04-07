@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual Environments 
+.venv/
+
+# Tool cache
+.cache/
+
+# Coverage reports
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# --- Type Checking ---
+.mypy_cache/
+
+# --- IDEs & Editors ---
+.vscode/
