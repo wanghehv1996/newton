@@ -76,33 +76,44 @@ class Example:
 
         # stablize the simulation (ref to example_mujoco.py)
         franka.default_shape_cfg.density = 100.0
-        franka.default_joint_cfg.armature = 0.1
-        franka.default_body_armature = 0.1
 
-        # franka = newton.ModelBuilder(gravity=0.0)
         print("Add franka")
         franka.add_urdf(
             newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
             floating=False,
             enable_self_collisions=False,
             collapse_fixed_joints=True,
-            force_show_colliders=False,
+            # force_show_colliders=False,
         )
 
-        franka.joint_q[:6] = [0.0, 0.0, 0.0, -1.59695, 0.0, 2.5307]
+        franka.joint_q[:7] = [0.0, 0.0, 0.0, -1.5, 0.0, 1.5, -0.7]
+
         print('body cnt', franka.body_count)
         self.robot_joint_q_cnt = len(franka.joint_q)
         print('robot joint q cnt', self.robot_joint_q_cnt)
 
+        # for b, shapes in franka.body_shapes.items():
+        #     print(f"body {b}, shape={len(shapes)}")
+        #     for shape in shapes:
+        #         print(shape)
+        for i in range(len(franka.shape_material_mu)):
+            # print(f"shape {i}, mu={franka.shape_material_mu[i]}, ka={franka.shape_material_ka[i]}")
+            franka.shape_material_mu[i] = 2.0
+            franka.shape_material_ka[i] = 0.002
+            franka.shape_is_solid[i] = True
+
         # print("Add box")
-        pos = wp.vec3(0.5, 0.2, 0.13)
+        pos = wp.vec3(0.5, 0.0, 0.13)
         rot = wp.quat_identity()
         body_box = franka.add_body(xform=wp.transform(p=pos, q=rot))
         franka.add_joint_free(body_box)
-        franka.add_shape_box(body_box, hx=0.03, hy=0.03, hz=0.03, cfg=newton.ModelBuilder.ShapeConfig(density=1000.0))
-        # franka.joint_q[9:] = [*pos, *rot]
-        # franka.add_shape_box(-1, wp.transform(wp.vec3(0.5, 0.2, 0.13), wp.quat_identity()), hx=0.03, hy=0.03, hz=0.03, cfg=newton.ModelBuilder.ShapeConfig(density=10.0))
-        print('body cnt', franka.body_count)
+        franka.add_shape_box(body_box, hx=0.03, hy=0.03, hz=0.03, cfg=newton.ModelBuilder.ShapeConfig(density=100.0))
+
+        # for i in range(len(franka.shape_material_mu)):
+        #     print(f"shape {i}, mu={franka.shape_material_mu[i]}, ka={franka.shape_material_ka[i]}")
+        #     franka.shape_material_mu[i] = 2.0
+        #     franka.shape_material_ka[i] = 0.002
+        #     franka.shape_is_solid[i] = True
 
         print("Add ground")
         franka.add_ground_plane()
@@ -113,6 +124,7 @@ class Example:
         self.model.ground = True
 
         self.viewer.set_model(self.model)
+        self.viewer.vsync = True
 
 
         print("ALL", self.model.state().body_q.numpy(), self.model.state().body_qd.numpy(), self.model.body_mass.numpy())
@@ -163,6 +175,8 @@ class Example:
         self.endeffector_offset = wp.transform([0.0, 0.0, 0.0], wp.quat_identity())
         print('ee_tf=',self.ee_tf)
         self.target = [*wp.transform_get_translation(self.ee_tf), *wp.transform_get_rotation(self.ee_tf)]
+
+        self.open_gripper = 1 # 1 for open, 0 for close
 
         # # ------------------------------------------------------------------
         # # IK setup (single problem, single EE)
@@ -222,7 +236,13 @@ class Example:
 
         # WH: add rigid solver
         # self.rigid_solver = newton.solvers.SolverFeatherstone(self.model)
-        self.rigid_solver = newton.solvers.SolverMuJoCo(self.model)
+        self.rigid_solver = newton.solvers.SolverMuJoCo(
+            self.model,
+            nefc_per_env=500,
+            ncon_per_env=500,
+            solver='newton',
+            impratio=100,
+        )
         print('set up mujoco')
         self.set_up_control()
 
@@ -354,8 +374,9 @@ class Example:
         delta_q = J_inv @ delta_target + N @ delta_q_null
 
         # TODO: Apply gripper finger control
-        # delta_q[-2] = self.target[-1] * 4 - q[-2]
-        # delta_q[-1] = self.target[-1] * 4 - q[-1]
+        gripper_target = ((self.open_gripper) * 0.2)
+        delta_q[-2] = (gripper_target - q[-2])
+        delta_q[-1] = (gripper_target - q[-1])
 
         self.target_joint_qd.assign(delta_q)
 
@@ -398,6 +419,13 @@ class Example:
     # Template API
     # ----------------------------------------------------------------------
     def step(self):
+
+        if hasattr(self.viewer, "is_key_down"):
+            if self.viewer.is_key_down("e"):
+                self.open_gripper = 0
+            else:
+                self.open_gripper = 1
+
         # TODO:
         # self._push_targets_from_gizmos()
         self.generate_control_joint_qd(self.state_0)
@@ -409,7 +437,8 @@ class Example:
 
         # print("CURRENT Q ", self.state_0.body_q.numpy())
         # print("CURRENT QD", self.state_0.body_qd.numpy())
-        # print("CURRENT M ", self.model.body_mass.numpy())
+        # print("CURRENT JQ", self.state_0.joint_q.numpy())
+        # print("MJW CONDIM",self.rigid_solver.mjw_model.geom_condim.numpy())
 
     def test(self):
         pass
