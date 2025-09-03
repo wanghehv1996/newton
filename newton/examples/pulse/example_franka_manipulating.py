@@ -12,6 +12,9 @@ import newton.examples
 import newton.ik as ik
 import newton.utils
 
+import os
+
+
 def allclose(a: wp.vec3, b: wp.vec3, rtol=1e-5, atol=1e-8):
     return (
         wp.abs(a[0] - b[0]) <= (atol + rtol * wp.abs(b[0]))
@@ -74,50 +77,54 @@ class Example:
         # ------------------------------------------------------------------
         franka = newton.ModelBuilder()
 
-        # stablize the simulation (ref to example_mujoco.py)
         franka.default_shape_cfg.density = 100.0
 
-        print("Add franka")
-        franka.add_urdf(
-            newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
+        # NOTE:
+        # The original Franka model from Newton has issues with missing collisions and incorrect coloring when used with the MuJoCo solver.
+        # As a temporary workaround, the Genesis Franka model is used instead.
+        # Steps:
+        #   1. Download the Genesis Franka model from:
+        #      http://69.235.177.182:8081/externalrepo/Genesis/-/tree/9b8a40a84cf74b3fd5d63ec42877c98192ba681c/genesis/assets/xml/franka_emika_panda
+        #   2. Move the downloaded model to: ./newton/examples/assets/franka_emika_panda
+
+        # franka.add_urdf(
+        #     newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
+        #     floating=False,
+        #     enable_self_collisions=False,
+        #     collapse_fixed_joints=True,
+        #     # force_show_colliders=False,
+        # )
+
+        franka.add_mjcf(
+            newton.examples.get_asset("franka_emika_panda/panda.xml"),
+            # xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()),
             floating=False,
             enable_self_collisions=False,
-            collapse_fixed_joints=True,
+            collapse_fixed_joints=False,
             # force_show_colliders=False,
         )
 
+        # Set initial joint configuration
         franka.joint_q[:7] = [0.0, 0.0, 0.0, -1.5, 0.0, 1.5, -0.7]
 
-        print('body cnt', franka.body_count)
         self.robot_joint_q_cnt = len(franka.joint_q)
-        print('robot joint q cnt', self.robot_joint_q_cnt)
 
-        # for b, shapes in franka.body_shapes.items():
-        #     print(f"body {b}, shape={len(shapes)}")
-        #     for shape in shapes:
-        #         print(shape)
-        for i in range(len(franka.shape_material_mu)):
-            # print(f"shape {i}, mu={franka.shape_material_mu[i]}, ka={franka.shape_material_ka[i]}")
-            franka.shape_material_mu[i] = 2.0
-            franka.shape_material_ka[i] = 0.002
-            franka.shape_is_solid[i] = True
-
-        # print("Add box")
+        # Add a box
         pos = wp.vec3(0.5, 0.0, 0.13)
         rot = wp.quat_identity()
         body_box = franka.add_body(xform=wp.transform(p=pos, q=rot))
         franka.add_joint_free(body_box)
-        franka.add_shape_box(body_box, hx=0.03, hy=0.03, hz=0.03, cfg=newton.ModelBuilder.ShapeConfig(density=100.0))
+        franka.add_shape_box(body_box, hx=0.04, hy=0.04, hz=0.04, cfg=newton.ModelBuilder.ShapeConfig(density=1.0))
 
-        # for i in range(len(franka.shape_material_mu)):
-        #     print(f"shape {i}, mu={franka.shape_material_mu[i]}, ka={franka.shape_material_ka[i]}")
-        #     franka.shape_material_mu[i] = 2.0
-        #     franka.shape_material_ka[i] = 0.002
-        #     franka.shape_is_solid[i] = True
+        # Update friction and material properties for all shapes
+        for i in range(len(franka.shape_material_mu)):
+            # print(f"shape {i}, mu={franka.shape_material_mu[i]}, ka={franka.shape_material_ka[i]}")
+            franka.shape_material_mu[i] = 1.0
+            franka.shape_material_ka[i] = 0.002
+            franka.shape_is_solid[i] = True
 
-        print("Add ground")
+        # Add the ground
         franka.add_ground_plane()
-        print('body cnt', franka.body_count)
 
         self.graph = None
         self.model = franka.finalize()
@@ -126,13 +133,7 @@ class Example:
         self.viewer.set_model(self.model)
         self.viewer.vsync = True
 
-
-        print("ALL", self.model.state().body_q.numpy(), self.model.state().body_qd.numpy(), self.model.body_mass.numpy())
-
-        # states
-        # self.state = self.model.state()
-
-        # WH: target state
+        # Target state initialization
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.target_joint_qd = wp.empty_like(self.state_0.joint_qd)
@@ -141,27 +142,15 @@ class Example:
 
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
-        body_mass_np = self.model.body_mass.numpy()
-        body_group_np = self.model.body_group.numpy()
-        for i in range(self.model.body_count):
-            print(f"Body {i}: m={body_mass_np[i]}, g={body_group_np[i]}")
-
-        joint_parent_np = self.model.joint_parent.numpy()
-        joint_child_np = self.model.joint_child.numpy()
-        joint_type_np = self.model.joint_type.numpy()
-        for i in range(self.model.joint_count):
-            print(f"Body {i}: p={joint_parent_np[i]}, c={joint_child_np[i]}, t={joint_type_np[i]}")
-
-
-        print("ALL aft FK", self.model.state().body_q.numpy(),self.model.state().body_qd.numpy())
 
         # ------------------------------------------------------------------
         # End effector
         # ------------------------------------------------------------------
-        # self.ee_index = 10  # hardcoded for now
+        # self.ee_index = 10  # For uncollapsed URDF from Newton asset
+        # self.ee_index = 6   # For collapsed URDF from Newton asset
         # 12, 13 are the two fingers
-        self.ee_index = 6  # hardcoded for now
-        print(self.ee_index)
+        
+        self.ee_index = 8  # For panda.xml (Genesis MJCF)
 
         # Persistent gizmo transform (pass-by-ref mutated by viewer)
         body_q_np = self.state_0.body_q.numpy()
@@ -169,7 +158,7 @@ class Example:
         self.ee_tf = wp.transform(*body_q_np[self.ee_index])
 
 
-        # WH: control
+        # Control setup
         # [ p.xyz, rot.wxyz, gripper ]
         self.endeffector_id = self.ee_index
         self.endeffector_offset = wp.transform([0.0, 0.0, 0.0], wp.quat_identity())
@@ -238,7 +227,8 @@ class Example:
         # self.rigid_solver = newton.solvers.SolverFeatherstone(self.model)
         self.rigid_solver = newton.solvers.SolverMuJoCo(
             self.model,
-            nefc_per_env=500,
+            # nefc_per_env=500,
+            njmax=500,
             ncon_per_env=500,
             solver='newton',
             impratio=100,
