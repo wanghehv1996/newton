@@ -24,11 +24,21 @@
 ###########################################################################
 
 import warp as wp
+import numpy as np
 
 import newton
 import newton.examples
 import newton.ik as ik
 import newton.utils
+
+def limit_joint_move(tar_q, cur_q, max_qd, dt):
+    err = tar_q-cur_q
+    max_qd = max_qd*dt
+    min_qd = -1 * max_qd
+    
+    delta_q = np.clip(err*0.8,min_qd,max_qd)
+
+    return delta_q, delta_q + cur_q
 
 def transform_diff(tf1, tf2, pos_thres=0.01, rot_thres=0.01):
     # Translational distance
@@ -50,6 +60,16 @@ def transform_diff(tf1, tf2, pos_thres=0.01, rot_thres=0.01):
 # map [0,1] to [low, high]
 def linear_map(theta, lo, hi):
     return lo + theta*(hi-lo)
+
+from enum import IntEnum
+
+class ArmControlType(IntEnum):
+
+    DIRECT = 0 # direct set arm to target position
+
+    TARGET_POSITION = 1 # set it into control.joint_target, unimplemented
+
+    PID = 2
 
 
 class Example:
@@ -79,17 +99,17 @@ class Example:
         # Configure target position control for arm joints.
         for i in range(self.robot_joint_q_cnt):
             franka.joint_dof_mode[i] = newton.JointMode.TARGET_POSITION
-            # franka.joint_target_ke[i] = 600.0
-            # franka.joint_target_kd[i] = 10.0
-            # franka.joint_target_ke[i] = 1000.0
-            franka.joint_target_ke[i] = 1500.0
-            franka.joint_target_kd[i] = 5.0
-
-        # Disable joint control for finger joints.
-        for i in range(self.robot_joint_q_cnt-2, self.robot_joint_q_cnt):
-            franka.joint_dof_mode[i] = newton.JointMode.NONE
-            franka.joint_target_ke[i] = 100.0
+            franka.joint_target_ke[i] = 3000.0
             franka.joint_target_kd[i] = 10.0
+
+        # Configure target velocity control for finger joints
+        for i in range(self.robot_joint_q_cnt-2, self.robot_joint_q_cnt):
+            # franka.joint_dof_mode[i] = newton.JointMode.TARGET_POSITION
+            # franka.joint_target_ke[i] = 1500.0
+            # franka.joint_target_kd[i] = 10.0
+
+            franka.joint_dof_mode[i] = newton.JointMode.TARGET_VELOCITY
+            franka.joint_target_kd[i] = 1.0
         
         # Set initial pose
         franka.joint_q[:7] = [
@@ -97,12 +117,17 @@ class Example:
             0, 1.2, -0.8
         ]
 
+        # Set indices for the end-effector and fingers
+        self.ee_index = 10  # hardcoded for now, end effector body index
+        self.lf_index = self.robot_joint_q_cnt - 2 # left finger joint index
+        self.rf_index = self.robot_joint_q_cnt - 1 # right finger joint index
+
         # Add a box
         pos = wp.vec3(0.5, 0.0, 0.13)
         rot = wp.quat_identity()
         body_box = franka.add_body(xform=wp.transform(p=pos, q=rot))
         franka.add_joint_free(body_box)
-        franka.add_shape_box(body_box, hx=0.03, hy=0.03, hz=0.03, cfg=newton.ModelBuilder.ShapeConfig(density=1.0))
+        franka.add_shape_box(body_box, hx=0.03, hy=0.03, hz=0.03, cfg=newton.ModelBuilder.ShapeConfig(density=100.0))
 
         # Set friction
         for i in range(len(franka.shape_material_mu)):
@@ -132,9 +157,6 @@ class Example:
         # ------------------------------------------------------------------
         # End effector
         # ------------------------------------------------------------------
-        self.ee_index = 10  # hardcoded for now
-        self.lf_index = 7 # left finger
-        self.rf_index = 8 # left finger
         self.open_gripper = 1
 
         # Persistent gizmo transform (pass-by-ref mutated by viewer)
@@ -185,27 +207,25 @@ class Example:
         )
 
         # Variables the solver will update
-        self.joint_q = wp.array(self.model.joint_q, shape=(1, self.model.joint_coord_count))
-
-        print("self.joint_q", self.joint_q)
-        print("self.body_mass", self.model.body_mass)
-
+        self.ik_joint_q = wp.array(self.model.joint_q, shape=(1, self.model.joint_coord_count))
         self.ik_iters = 24
+
+        # IK solver
         self.solver = ik.IKSolver(
             model=self.model,
-            joint_q=self.joint_q,
+            joint_q=self.ik_joint_q,
             objectives=[self.pos_obj, self.rot_obj, self.obj_joint_limits],
             lambda_initial=0.1,
             jacobian_mode=ik.IKJacobianMode.ANALYTIC,
         )
 
+        # Rigid body solver
         self.rigid_solver = newton.solvers.SolverMuJoCo(
             self.model,
-            # nefc_per_env=500,
-            # njmax=500,
-            # ncon_per_env=500,
+            njmax=500,
             solver='newton',
-            # impratio=100,
+            cone="elliptic",
+            contact_stiffness_time_const=self.sim_dt # important param to ensure zero penetration
         )
 
         self.capture()
@@ -241,14 +261,11 @@ class Example:
             # swap state
             (self.state_0, self.state_1) = (self.state_1, self.state_0)
 
-
     def _push_targets_from_gizmos(self):
         """Read gizmo-updated transform and push into IK objectives."""
         self.pos_obj.set_target_position(0, wp.transform_get_translation(self.ee_tf))
         q = wp.transform_get_rotation(self.ee_tf)
-        q_normalized = wp.normalize(q)
-        
-        self.rot_obj.set_target_rotation(0, wp.vec4(q_normalized[0], q_normalized[1], q_normalized[2], q_normalized[3]))
+        self.rot_obj.set_target_rotation(0, wp.vec4(q[0], q[1], q[2], q[3]))
 
     # ----------------------------------------------------------------------
     # Template API
@@ -263,31 +280,42 @@ class Example:
             else:
                 self.open_gripper = 1
 
-        # IK step, update self.joint_q as the target pose
+        # IK step, update self.ik_joint_q as the target pose
         if self.ik_graph:
             wp.capture_launch(self.ik_graph)
         else:
             self.ik_simulate()
 
-        # Update control targets according to self.joint_q
-        joint_q_np = self.joint_q.numpy()
-        
-        # Control the arm joints using control.joint_target
-        self.joint_q[0,0:self.lf_index].assign(joint_q_np[0,0:self.lf_index])
 
-        newton.eval_fk(self.model, self.joint_q.flatten(), self.model.joint_qd, self.state)
-        self.control.joint_target[0:self.lf_index].assign(self.joint_q.flatten()[0:self.lf_index])
+        ik_joint_q = self.ik_joint_q.flatten()
 
-        # Control the finger joints using control.joint_f
-        # Apply a force of -0.05 to grasp, 1 to release
-        self.control.joint_f[self.lf_index:self.lf_index+1].assign([
-            linear_map(self.open_gripper, -0.05, 1)
+        # Align the self.state with the target body in the viewer
+        newton.eval_fk(self.model, ik_joint_q, self.model.joint_qd, self.state)
+
+        # Limit the joint movement for the arm in one frame
+        move, target = limit_joint_move(ik_joint_q[0:self.lf_index].numpy(), self.state_0.joint_q[0:self.lf_index].numpy(), 2.0, self.frame_dt)
+
+        # Set joint target position for the arm
+        self.control.joint_target[0:self.lf_index].assign(target.flatten()[0:self.lf_index])
+
+        # Manually reset joint velocity to stablize the simulation (Not sure why)
+        self.state_0.joint_qd[0:self.lf_index].assign(move[0:self.lf_index]/self.frame_dt)
+
+        # Set joint target position for the fingers
+        # self.control.joint_target[self.lf_index:self.lf_index+1].assign([
+        #     linear_map(self.open_gripper, 0.02, 0.04)
+        # ])
+        # self.control.joint_target[self.rf_index:self.rf_index+1].assign([
+        #     linear_map(self.open_gripper, 0.02, 0.04),
+        # ])
+
+        # Set joint target velocity for the fingers
+        self.control.joint_target[self.lf_index:self.lf_index+1].assign([
+            linear_map(self.open_gripper, -1.0, 1.0)
         ])
-        self.control.joint_f[self.lf_index:self.rf_index+1].assign([
-            linear_map(self.open_gripper, -0.05, 1),
+        self.control.joint_target[self.rf_index:self.rf_index+1].assign([
+            linear_map(self.open_gripper, -1.0, 1.0),
         ])
-        # joint_q_np[0, self.lf_index] = (self.open_gripper) * 0.1
-        # joint_q_np[0, self.rf_index] = (self.open_gripper) * 0.1
 
         # Physics step
         if self.physics_graph:
@@ -312,19 +340,11 @@ class Example:
 
         # Register gizmo (viewer will draw & mutate transform in-place)
         self.viewer.log_gizmo("target_tcp", self.ee_tf)
-        
-        # Visualize the current articulated state
-        # newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state)
-
         self.viewer.log_state(self.state_0)
         self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
 
         wp.synchronize()
-
-
-
-
 
 if __name__ == "__main__":
     viewer, args = newton.examples.init()
