@@ -109,7 +109,7 @@ class Example:
         self.controllable_joints_cnt = self.robot_joint_q_cnt
 
         # Add a box
-        pos = wp.vec3(0.5, 0.0, 0.13)
+        pos = wp.vec3(0.6, 0.0, 0.13)
         rot = wp.quat_identity()
         body_box = franka.add_body(xform=wp.transform(p=pos, q=rot))
         franka.add_joint_free(body_box)
@@ -366,7 +366,7 @@ class Example:
         # self.viewer.log_state(self.state)
         self.viewer.log_state(self.state_0)
 
-        # self.viewer.log_contacts(self.contacts, self.state)
+        self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
 
         wp.synchronize()
