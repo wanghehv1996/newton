@@ -851,6 +851,10 @@ class ViewerGL(ViewerBase):
                     show_contacts = self.show_contacts
                     changed, self.show_contacts = imgui.checkbox("Show Contacts", show_contacts)
 
+                    # Contact force visualization
+                    show_contact_forces = self.show_contact_forces
+                    changed, self.show_contact_forces = imgui.checkbox("Show Contact Forces", show_contact_forces)
+
                     # Particle visualization
                     show_particles = self.show_particles
                     changed, self.show_particles = imgui.checkbox("Show Particles", show_particles)

@@ -48,6 +48,10 @@ class ViewerBase:
         self._contact_points0 = None
         self._contact_points1 = None
 
+        # line vertices for contact force vizualization
+        self._contact_force_points0 = None
+        self._contact_force_points1 = None
+
         # line vertices for joint basis vectors (3 lines per joint)
         self._joint_points0 = None
         self._joint_points1 = None
@@ -58,6 +62,7 @@ class ViewerBase:
         self.show_com = False
         self.show_particles = False
         self.show_contacts = False
+        self.show_contact_forces = False
         self.show_springs = False
         self.show_triangles = True
 
@@ -171,6 +176,67 @@ class ViewerBase:
         colors = (0.0, 1.0, 0.0)
 
         self.log_lines("/contacts", starts, ends, colors)
+
+    def log_contact_forces(self, contact_forces, state):
+        """
+        Creates line segments along contact forces for rendering.
+        Args:
+            name: Identifier for the contact forces
+            contact_forces (wp.array): The contacts to render.
+            state: Current simulation state
+        """
+
+        if not self.show_contact_forces:
+            # Pass None to hide joints - renderer will handle creating empty arrays
+            self.log_lines("/contact_forces", None, None, None)
+            return
+
+        # Get contact count (handle case where it might be zero)
+        particle_num = contact_forces.shape[0]
+
+        # Ensure we have buffers for line endpoints
+        if self._contact_force_points0 is None or len(self._contact_force_points0) < particle_num:
+            self._contact_force_points0 = wp.array(np.zeros((particle_num, 3)), dtype=wp.vec3, device=self.device)
+            self._contact_force_points1 = wp.array(np.zeros((particle_num, 3)), dtype=wp.vec3, device=self.device)
+
+        num_valid_contact_forces = 0
+
+        # Always run the kernel to ensure buffers are properly cleared/updated
+        if particle_num > 0:
+            from .kernels import compute_contact_forces  # noqa: PLC0415
+
+            wp.launch(
+                kernel=compute_contact_forces,
+                dim=particle_num,
+                inputs=[
+                    state.particle_q,
+                    contact_forces,
+                    0.1,  # line length scale factor
+                ],
+                outputs=[
+                    self._contact_force_points0,  # line start points
+                    self._contact_force_points1,  # line end points
+                ],
+                device=self.device,
+            )
+
+        # # Always call log_lines to update the renderer (handles zero contacts gracefully)
+        # if num_valid_contact_forces > 0:
+        #     # Slice arrays to only include active contacts
+        #     starts = self._contact_points0[:num_valid_contact_forces]
+        #     ends = self._contact_points1[:num_valid_contact_forces]
+        # else:
+        #     # Create empty arrays for zero contacts case
+        #     starts = wp.array([], dtype=wp.vec3, device=self.device)
+        #     ends = wp.array([], dtype=wp.vec3, device=self.device)
+
+        starts = self._contact_force_points0
+        ends = self._contact_force_points1
+
+        # Use orange-red color for contact normals
+        colors = (1.0, 0.0, 0.0)
+
+        self.log_lines("/contact_forces", starts, ends, colors)
 
     def log_shapes(
         self,

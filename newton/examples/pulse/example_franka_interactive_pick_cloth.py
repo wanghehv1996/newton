@@ -431,6 +431,7 @@ class Example:
         self.viewer.log_gizmo("target_tcp", self.ee_tf)
         self.viewer.log_state(self.state_0)
         self.viewer.log_contacts(self.contacts, self.state_0)
+        self.viewer.log_contact_forces(self.cloth_solver.particle_forces, self.state_0)
         self.viewer.end_frame()
 
         wp.synchronize()

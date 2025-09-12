@@ -187,6 +187,27 @@ def compute_contact_lines(
     line_start[tid] = contact_center
     line_end[tid] = contact_center + line_vector
 
+@wp.kernel
+def compute_contact_forces(
+    particle_q: wp.array(dtype=wp.vec3),
+    contact_forces: wp.array(dtype=wp.vec3),
+    line_scale: float,
+    # outputs
+    line_start: wp.array(dtype=wp.vec3),
+    line_end: wp.array(dtype=wp.vec3),
+):
+    """Create line segments along contact forces for visualization."""
+    tid = wp.tid()
+    count = particle_q.shape[0]
+    if tid >= count:
+        line_start[tid] = wp.vec3(wp.nan, wp.nan, wp.nan)
+        line_end[tid] = wp.vec3(wp.nan, wp.nan, wp.nan)
+        return
+
+    start = particle_q[tid]
+
+    line_start[tid] = start
+    line_end[tid] = start + contact_forces[tid] * line_scale  # Placeholder for force direction
 
 @wp.kernel
 def compute_joint_basis_lines(
