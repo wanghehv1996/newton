@@ -210,6 +210,43 @@ def compute_contact_forces(
     line_end[tid] = start + contact_forces[tid] * line_scale  # Placeholder for force direction
 
 @wp.kernel
+def compute_particle_body_contacts(
+    body_q: wp.array(dtype=wp.transform),
+    shape_body: wp.array(dtype=int),
+    contact_count: wp.array(dtype=int),
+    contact_shape: wp.array(dtype=int),
+    contact_body_pos: wp.array(dtype=wp.vec3),
+    contact_force: wp.array(dtype=wp.vec3),
+    line_scale: float,
+    # outputs
+    line_start: wp.array(dtype=wp.vec3),
+    line_end: wp.array(dtype=wp.vec3),
+):
+    """Create line segments along contact normals for visualization."""
+    tid = wp.tid()
+    count = contact_count[0]
+    if tid >= count:
+        line_start[tid] = wp.vec3(wp.nan, wp.nan, wp.nan)
+        line_end[tid] = wp.vec3(wp.nan, wp.nan, wp.nan)
+        return
+
+    shape_index = contact_shape[tid]
+    body_index = shape_body[shape_index]
+
+    X_wb = wp.transform_identity()
+    if body_index >= 0:
+        X_wb = body_q[body_index]
+
+    # Compute world space contact positions as the line start
+    contact_center = wp.transform_point(X_wb, contact_body_pos[tid])
+    # contact_center = contact_body_pos[tid]
+
+    line_vector = contact_force[tid] * line_scale
+
+    line_start[tid] = contact_center
+    line_end[tid] = contact_center + line_vector
+
+@wp.kernel
 def compute_joint_basis_lines(
     joint_type: wp.array(dtype=int),
     joint_parent: wp.array(dtype=int),
