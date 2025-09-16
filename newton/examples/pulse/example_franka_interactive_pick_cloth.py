@@ -64,14 +64,19 @@ def linear_map(theta, lo, hi):
 
 from enum import IntEnum
 
-class ArmControlType(IntEnum):
+class GripperControlType(IntEnum):
+    """
+    Flags for gripper actuator controlling.
+    """
 
-    DIRECT = 0 # direct set arm to target position
+    NONE = 0
+    """None."""
 
-    TARGET_POSITION = 1 # set it into control.joint_target, unimplemented
+    TARGET_POSITION = 1
+    """Control the gripper finger by setting the target position."""
 
-    PID = 2
-
+    TARGET_VELOCITY = 2
+    """Control the gripper finger by setting the target velocity."""
 
 class Example:
     def __init__(self, viewer):
@@ -95,7 +100,7 @@ class Example:
         self.soft_contact_kd = 2e-3
 
         self.robot_friction = 1.0
-        self.table_friction = 0.5
+        self.table_friction = 0.25
         self.self_contact_friction = 0.25
 
         #   elasticity
@@ -108,6 +113,9 @@ class Example:
 
         self.scene = newton.ModelBuilder()
         self.soft_contact_max = 1000000
+
+        self.gripper_control_type = GripperControlType.TARGET_VELOCITY
+        # self.gripper_control_type = GripperControlType.TARGET_POSITION
 
         self.viewer = viewer
 
@@ -130,14 +138,26 @@ class Example:
             franka.joint_target_ke[i] = 3000.0
             franka.joint_target_kd[i] = 10.0
 
-        # Configure target velocity control for finger joints
+        # Configure joint limits for finger joints
         for i in range(self.robot_joint_q_cnt-2, self.robot_joint_q_cnt):
-            # franka.joint_dof_mode[i] = newton.JointMode.TARGET_POSITION
-            # franka.joint_target_ke[i] = 1500.0
-            # franka.joint_target_kd[i] = 10.0
 
-            franka.joint_dof_mode[i] = newton.JointMode.TARGET_VELOCITY
-            franka.joint_target_kd[i] = 1.0
+            # Leave a small gap to avoid penetration
+            franka.joint_limit_lower[i] = 0.001
+            franka.joint_limit_upper[i] = 0.04
+
+            # Configure target control for finger joints
+            if self.gripper_control_type == GripperControlType.NONE:
+                franka.joint_dof_mode[i] = newton.JointMode.NONE
+
+            if self.gripper_control_type == GripperControlType.TARGET_POSITION:
+                franka.joint_dof_mode[i] = newton.JointMode.TARGET_POSITION
+                franka.joint_target_ke[i] = 3000.0
+                franka.joint_target_kd[i] = 10.0
+
+            if self.gripper_control_type == GripperControlType.TARGET_VELOCITY:
+                franka.joint_dof_mode[i] = newton.JointMode.TARGET_VELOCITY
+                franka.joint_target_kd[i] = 1.0
+
         
         # Set initial pose
         franka.joint_q[:7] = [
@@ -164,27 +184,58 @@ class Example:
         self.scene.add_joint_fixed(-1, body_box)
         self.scene.add_shape_box(body_box, xform=wp.transform(p=pos, q=rot), hx=0.4, hy=0.4, hz=0.1)
 
-        # Add the T-shirt
-        usd_stage = Usd.Stage.Open(newton.examples.get_asset("unisex_shirt.usd"))
-        usd_geom = UsdGeom.Mesh(usd_stage.GetPrimAtPath("/root/shirt"))
-        mesh_points = np.array(usd_geom.GetPointsAttr().Get())
-        mesh_indices = np.array(usd_geom.GetFaceVertexIndicesAttr().Get())
-        vertices = [wp.vec3(v) for v in mesh_points]
-        self.scene.add_cloth_mesh(
-            vertices=vertices,
-            indices=mesh_indices,
-            rot=wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), np.pi),
-            pos=wp.vec3(0.0, 0.70, 0.28),
-            vel=wp.vec3(0.0, 0.0, 0.0),
-            density=0.2,
-            scale=0.01,
-            tri_ke=self.tri_ke,
-            tri_ka=self.tri_ka,
-            tri_kd=self.tri_kd,
-            edge_ke=self.bending_ke,
-            edge_kd=self.bending_kd,
-            particle_radius=self.cloth_particle_radius,
-        )
+        # # Add the T-shirt
+        # usd_stage = Usd.Stage.Open(newton.examples.get_asset("unisex_shirt.usd"))
+        # usd_geom = UsdGeom.Mesh(usd_stage.GetPrimAtPath("/root/shirt"))
+        # mesh_points = np.array(usd_geom.GetPointsAttr().Get())
+        # mesh_indices = np.array(usd_geom.GetFaceVertexIndicesAttr().Get())
+        # vertices = [wp.vec3(v) for v in mesh_points]
+        # self.scene.add_cloth_mesh(
+        #     vertices=vertices,
+        #     indices=mesh_indices,
+        #     rot=wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), np.pi),
+        #     pos=wp.vec3(0.0, 0.70, 0.28),
+        #     vel=wp.vec3(0.0, 0.0, 0.0),
+        #     density=0.2,
+        #     scale=0.01,
+        #     tri_ke=self.tri_ke,
+        #     tri_ka=self.tri_ka,
+        #     tri_kd=self.tri_kd,
+        #     edge_ke=self.bending_ke,
+        #     edge_kd=self.bending_kd,
+        #     particle_radius=self.cloth_particle_radius,
+        # )
+
+        # Add a square cloth
+        cloth_res=[24, 24]
+        cloth_dx=[0.005, 0.005]
+        cloth_mass = 0.2 * cloth_dx[0] * cloth_dx[1] * cloth_res[0] * cloth_res[1]
+        print("cloth mass=", cloth_mass)
+        common_params = {
+            "pos": wp.vec3(0.0, -0.60, 0.28),
+            "rot": wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), wp.pi * 0.5),
+            "vel": wp.vec3(0.0, 0.0, 0.0),
+            "dim_x": cloth_res[0],
+            "dim_y": cloth_res[1],
+            "cell_x": cloth_dx[0],
+            "cell_y": cloth_dx[1],
+            "mass": cloth_mass,
+            # "fix_left": True,
+            "edge_ke": self.bending_ke,
+            "edge_kd": self.bending_kd,
+            "particle_radius": self.cloth_particle_radius,
+        }
+        solver_params = {
+            "tri_ke": self.tri_ke,
+            "tri_ka": self.tri_ka,
+            "tri_kd": self.tri_kd,
+        }
+        self.scene.add_cloth_grid(**common_params, **solver_params)
+
+        common_params["pos"] += wp.vec3(0.0, 0.0, self.cloth_particle_radius*2)
+        self.scene.add_cloth_grid(**common_params, **solver_params)
+
+
         self.scene.color()
 
         # Add the ground
@@ -288,7 +339,7 @@ class Example:
 
         # Cloth solver
         self.model.edge_rest_angle.zero_()
-        self.cloth_solver = newton.solvers.SolverVBD(
+        self.cloth_solver = newton.solvers.SolverVBDPulse(
             self.model,
             iterations=self.iterations,
             self_contact_radius=self.self_contact_radius,
@@ -329,7 +380,9 @@ class Example:
             # Collision detection
             self.contacts = self.model.collide(self.state_0)
 
+            # TODO: comment out this line to apply particle-body contact force onto rigid bodies 
             self.state_0.clear_forces()
+            # self.state_0.clear_forces()
             self.state_1.clear_forces()
 
             # Clear particle info for rigid_solver
@@ -343,7 +396,7 @@ class Example:
             self.state_0.particle_f.zero_()
             self.model.particle_count = particle_count
 
-            # Solve the cloth
+            # Solve the cloth, add force onto state_1
             self.contacts = self.model.collide(self.state_0, soft_contact_margin=self.cloth_body_contact_margin)
             self.cloth_solver.step(self.state_0, self.state_1, None, self.contacts, self.sim_dt)
 
@@ -398,13 +451,37 @@ class Example:
         #     linear_map(self.open_gripper, 0.02, 0.04),
         # ])
 
-        # Set joint target velocity for the fingers
-        self.control.joint_target[self.lf_index:self.lf_index+1].assign([
-            linear_map(self.open_gripper, -1.0, 1.0)
-        ])
-        self.control.joint_target[self.rf_index:self.rf_index+1].assign([
-            linear_map(self.open_gripper, -1.0, 1.0),
-        ])
+        # Set joint target for the fingers
+        gripper_vel = 0.2
+
+        # Position control
+        if self.gripper_control_type == GripperControlType.TARGET_POSITION:
+
+            # Get IK target
+            ik_lf_q = self.model.joint_limit_lower[self.lf_index:self.lf_index+1]
+            ik_rf_q = self.model.joint_limit_lower[self.rf_index:self.rf_index+1]
+            if self.open_gripper:
+                ik_lf_q = self.model.joint_limit_upper[self.lf_index:self.lf_index+1]
+                ik_rf_q = self.model.joint_limit_upper[self.rf_index:self.rf_index+1]
+
+            ik_joint_q[self.lf_index:self.lf_index+1].assign(ik_lf_q)
+            ik_joint_q[self.rf_index:self.rf_index+1].assign(ik_rf_q)
+
+            # Get control signal
+            move, target = limit_joint_move(ik_joint_q[self.lf_index:self.rf_index+1].numpy(), self.state_0.joint_q[self.lf_index:self.rf_index+1].numpy(), gripper_vel, self.frame_dt)
+
+            # Set control signal
+            self.control.joint_target[self.lf_index:self.rf_index+1].assign(target.flatten())
+            self.state_0.joint_qd[self.lf_index:self.rf_index+1].assign(move/self.frame_dt)
+
+        # Velocity control
+        if self.gripper_control_type == GripperControlType.TARGET_VELOCITY:
+            self.control.joint_target[self.lf_index:self.lf_index+1].assign([
+                linear_map(self.open_gripper, -gripper_vel, gripper_vel)
+            ])
+            self.control.joint_target[self.rf_index:self.rf_index+1].assign([
+                linear_map(self.open_gripper, -gripper_vel, gripper_vel),
+            ])
 
         # Physics step
         if self.physics_graph:
@@ -430,7 +507,14 @@ class Example:
         # Register gizmo (viewer will draw & mutate transform in-place)
         self.viewer.log_gizmo("target_tcp", self.ee_tf)
         self.viewer.log_state(self.state_0)
+
+        # Visualize contacts
         self.viewer.log_contacts(self.contacts, self.state_0)
+
+        # Visualize particle-body contact forces on rigid bodies
+        self.viewer.log_particle_body_contacts(self.contacts, self.state_0)
+
+        # Visualize particle forces on cloth
         self.viewer.log_contact_forces(self.cloth_solver.particle_forces, self.state_0)
         self.viewer.end_frame()
 
