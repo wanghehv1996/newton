@@ -1676,6 +1676,7 @@ def accumulate_contact_force_and_hessian(
     # outputs: particle force and hessian
     particle_forces: wp.array(dtype=wp.vec3),
     particle_hessians: wp.array(dtype=wp.mat33),
+    contact_force: wp.array(dtype=wp.vec3),
 ):
     t_id = wp.tid()
     collision_info = collision_info_array[0]
@@ -1828,7 +1829,10 @@ def accumulate_contact_force_and_hessian(
             )
             wp.atomic_add(particle_forces, particle_idx, body_contact_force)
             wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
+            # body contact torqure from particle
             wp.atomic_add(body_f, body_index, body_spatial_force)
+            # contact force from particle
+            wp.atomic_add(contact_force, t_id, -body_contact_force)
 
 
 @wp.func
@@ -1940,6 +1944,7 @@ def accumulate_contact_force_and_hessian_no_self_contact(
     # outputs: particle force and hessian
     particle_forces: wp.array(dtype=wp.vec3),
     particle_hessians: wp.array(dtype=wp.mat33),
+    contact_force: wp.array(dtype=wp.vec3),
 ):
     t_id = wp.tid()
 
@@ -1973,7 +1978,10 @@ def accumulate_contact_force_and_hessian_no_self_contact(
             )
             wp.atomic_add(particle_forces, particle_idx, body_contact_force)
             wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
+            # body contact torqure from particle
             wp.atomic_add(body_f, body_index, body_spatial_force)
+            # contact force from particle
+            wp.atomic_add(contact_force, t_id, -body_contact_force)
 
 
 @wp.kernel
@@ -2235,7 +2243,7 @@ def solve_trimesh_with_self_contact_penetration_free_tile(
             )
 
 
-class SolverVBD(SolverBase):
+class SolverVBDPulse(SolverBase):
     """An implicit solver using Vertex Block Descent (VBD) for cloth simulation.
 
     References:
@@ -2566,7 +2574,7 @@ class SolverVBD(SolverBase):
                         contacts.soft_contact_body_vel,
                         contacts.soft_contact_normal,
                     ],
-                    outputs=[self.particle_forces, self.particle_hessians],
+                    outputs=[self.particle_forces, self.particle_hessians, contacts.soft_contact_force],
                     device=self.device,
                 )
 
@@ -2743,7 +2751,7 @@ class SolverVBD(SolverBase):
                             contacts.soft_contact_body_vel,
                             contacts.soft_contact_normal,
                         ],
-                        outputs=[self.particle_forces, self.particle_hessians],
+                        outputs=[self.particle_forces, self.particle_hessians, contacts.soft_contact_force],
                         device=self.device,
                         max_blocks=self.model.device.sm_count,
                     )

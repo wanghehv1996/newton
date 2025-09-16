@@ -14,7 +14,9 @@
 # limitations under the License.
 
 from .solver_vbd import SolverVBD
+from .solver_vbd_pulse import SolverVBDPulse
 
 __all__ = [
     "SolverVBD",
+    "SolverVBDPulse"
 ]

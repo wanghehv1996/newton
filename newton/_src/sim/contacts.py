@@ -64,6 +64,8 @@ class Contacts:
             self.soft_contact_body_vel = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)
             self.soft_contact_normal = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)
             self.soft_contact_tids = wp.full(soft_contact_max, -1, dtype=int)
+            # to be filled by the solver (currently unused)
+            self.soft_contact_force = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)
 
         self.requires_grad = requires_grad
 
@@ -84,6 +86,7 @@ class Contacts:
         self.soft_contact_particle.fill_(-1)
         self.soft_contact_shape.fill_(-1)
         self.soft_contact_tids.fill_(-1)
+        self.soft_contact_force.zero_()
 
     @property
     def device(self):
