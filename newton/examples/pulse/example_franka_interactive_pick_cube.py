@@ -63,14 +63,19 @@ def linear_map(theta, lo, hi):
 
 from enum import IntEnum
 
-class ArmControlType(IntEnum):
+class GripperControlType(IntEnum):
+    """
+    Flags for gripper actuator controlling.
+    """
 
-    DIRECT = 0 # direct set arm to target position
+    NONE = 0
+    """None."""
 
-    TARGET_POSITION = 1 # set it into control.joint_target, unimplemented
+    TARGET_POSITION = 1
+    """Control the gripper finger by setting the target position."""
 
-    PID = 2
-
+    TARGET_VELOCITY = 2
+    """Control the gripper finger by setting the target velocity."""
 
 class Example:
     def __init__(self, viewer):
@@ -80,6 +85,9 @@ class Example:
         self.sim_time = 0.0
         self.sim_substeps = 10
         self.sim_dt = self.frame_dt / self.sim_substeps
+
+        # self.gripper_control_type = GripperControlType.TARGET_VELOCITY
+        self.gripper_control_type = GripperControlType.TARGET_POSITION
 
         self.viewer = viewer
 
@@ -102,14 +110,26 @@ class Example:
             franka.joint_target_ke[i] = 3000.0
             franka.joint_target_kd[i] = 10.0
 
-        # Configure target velocity control for finger joints
+        # Configure joint limits for finger joints
         for i in range(self.robot_joint_q_cnt-2, self.robot_joint_q_cnt):
-            # franka.joint_dof_mode[i] = newton.JointMode.TARGET_POSITION
-            # franka.joint_target_ke[i] = 1500.0
-            # franka.joint_target_kd[i] = 10.0
 
-            franka.joint_dof_mode[i] = newton.JointMode.TARGET_VELOCITY
-            franka.joint_target_kd[i] = 1.0
+            # Leave a small gap to avoid penetration
+            franka.joint_limit_lower[i] = 0.001
+            franka.joint_limit_upper[i] = 0.04
+
+            # Configure target control for finger joints
+            if self.gripper_control_type == GripperControlType.NONE:
+                franka.joint_dof_mode[i] = newton.JointMode.NONE
+
+            if self.gripper_control_type == GripperControlType.TARGET_POSITION:
+                franka.joint_dof_mode[i] = newton.JointMode.TARGET_POSITION
+                franka.joint_target_ke[i] = 3000.0
+                franka.joint_target_kd[i] = 10.0
+
+            if self.gripper_control_type == GripperControlType.TARGET_VELOCITY:
+                franka.joint_dof_mode[i] = newton.JointMode.TARGET_VELOCITY
+                franka.joint_target_kd[i] = 10.0
+
         
         # Set initial pose
         franka.joint_q[:7] = [
@@ -309,13 +329,37 @@ class Example:
         #     linear_map(self.open_gripper, 0.02, 0.04),
         # ])
 
-        # Set joint target velocity for the fingers
-        self.control.joint_target[self.lf_index:self.lf_index+1].assign([
-            linear_map(self.open_gripper, -1.0, 1.0)
-        ])
-        self.control.joint_target[self.rf_index:self.rf_index+1].assign([
-            linear_map(self.open_gripper, -1.0, 1.0),
-        ])
+        # Set joint rgetta for the fingers
+        gripper_vel = 0.2
+
+        # Position control
+        if self.gripper_control_type == GripperControlType.TARGET_POSITION:
+
+            # Get IK target
+            ik_lf_q = self.model.joint_limit_lower[self.lf_index:self.lf_index+1]
+            ik_rf_q = self.model.joint_limit_lower[self.rf_index:self.rf_index+1]
+            if self.open_gripper:
+                ik_lf_q = self.model.joint_limit_upper[self.lf_index:self.lf_index+1]
+                ik_rf_q = self.model.joint_limit_upper[self.rf_index:self.rf_index+1]
+
+            ik_joint_q[self.lf_index:self.lf_index+1].assign(ik_lf_q)
+            ik_joint_q[self.rf_index:self.rf_index+1].assign(ik_rf_q)
+
+            # Get control signal
+            move, target = limit_joint_move(ik_joint_q[self.lf_index:self.rf_index+1].numpy(), self.state_0.joint_q[self.lf_index:self.rf_index+1].numpy(), gripper_vel, self.frame_dt)
+
+            # Set control signal
+            self.control.joint_target[self.lf_index:self.rf_index+1].assign(target.flatten())
+            self.state_0.joint_qd[self.lf_index:self.rf_index+1].assign(move/self.frame_dt)
+
+        # Velocity control
+        if self.gripper_control_type == GripperControlType.TARGET_VELOCITY:
+            self.control.joint_target[self.lf_index:self.lf_index+1].assign([
+                linear_map(self.open_gripper, -gripper_vel, gripper_vel)
+            ])
+            self.control.joint_target[self.rf_index:self.rf_index+1].assign([
+                linear_map(self.open_gripper, -gripper_vel, gripper_vel),
+            ])
 
         # Physics step
         if self.physics_graph:
