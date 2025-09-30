@@ -21,6 +21,7 @@ import newton
 import newton.examples
 import newton.utils
 from newton import Mesh, ParticleFlags
+from newton._src.solvers.style3d import Collision
 
 
 class Example:
@@ -30,11 +31,11 @@ class Example:
         self.frame_dt = 1.0 / self.fps
 
         # must be an even number when using CUDA Graph
-        self.sim_substeps = 2
+        self.sim_substeps = 10
         self.sim_time = 0.0
         self.sim_dt = self.frame_dt / self.sim_substeps
 
-        self.iterations = 20
+        self.iterations = 4
 
         self.viewer = viewer
         builder = newton.Style3DModelBuilder(up_axis=newton.Axis.Z)
@@ -123,11 +124,13 @@ class Example:
         self.model.soft_contact_ke = 1.0e1
         self.model.soft_contact_kd = 1.0e-6
         self.model.soft_contact_mu = 0.2
-        self.model.gravity = wp.vec3(0.0, 0.0, -9.81)
+        self.model.set_gravity((0.0, 0.0, -9.81))
 
         self.solver = newton.solvers.SolverStyle3D(
-            self.model,
-            self.iterations,
+            model=self.model,
+            iterations=self.iterations,
+            collision_handler=Collision(self.model),
+            # collision_handler = CollisionHandler(self.model),
         )
         self.solver.precompute(
             builder,

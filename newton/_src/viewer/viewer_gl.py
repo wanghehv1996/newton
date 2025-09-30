@@ -122,7 +122,31 @@ class ViewerGL(ViewerBase):
         # UI visibility toggle
         self.show_ui = True
 
+        # UI callback system - organized by position
+        # positions: "side", "stats", "free"
+        self._ui_callbacks = {"side": [], "stats": [], "free": []}
+
         self.set_model(None)
+
+    def register_ui_callback(self, callback, position="side"):
+        """
+        Register a UI callback to be rendered during the UI phase.
+
+        Args:
+            callback: Function to be called during UI rendering
+            position: Position where the UI should be rendered. One of:
+                     "side" - Side callback (default)
+                     "stats" - Stats/metrics area
+                     "free" - Free-floating UI elements
+        """
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+
+        if position not in self._ui_callbacks:
+            valid_positions = list(self._ui_callbacks.keys())
+            raise ValueError(f"Invalid position '{position}'. Must be one of: {valid_positions}")
+
+        self._ui_callbacks[position].append(callback)
 
     # helper function to create a low resolution sphere mesh for point rendering
     def _create_point_mesh(self):
@@ -162,6 +186,11 @@ class ViewerGL(ViewerBase):
         fb_w, fb_h = self.renderer.window.get_framebuffer_size()
         self.camera = Camera(width=fb_w, height=fb_h, up_axis=model.up_axis if model else "Z")
 
+    def set_camera(self, pos: wp.vec3, pitch: float, yaw: float):
+        self.camera.pos = pos
+        self.camera.pitch = pitch
+        self.camera.yaw = yaw
+
     def log_mesh(
         self,
         name,
@@ -198,7 +227,7 @@ class ViewerGL(ViewerBase):
         self.objects[name].hidden = hidden
         self.objects[name].backface_culling = backface_culling
 
-    def log_instances(self, name, mesh, xforms, scales, colors, materials):
+    def log_instances(self, name, mesh, xforms, scales, colors, materials, hidden=False):
         """
         Log a batch of mesh instances for rendering.
 
@@ -217,10 +246,15 @@ class ViewerGL(ViewerBase):
         if not isinstance(self.objects[mesh], MeshGL):
             raise RuntimeError(f"Path {mesh} is not a Mesh object")
 
+        needs_update = not hidden
         if name not in self.objects:
             self.objects[name] = MeshInstancerGL(len(xforms), self.objects[mesh])
+            needs_update = True
 
-        self.objects[name].update_from_transforms(xforms, scales, colors, materials)
+        if needs_update:
+            self.objects[name].update_from_transforms(xforms, scales, colors, materials)
+
+        self.objects[name].hidden = hidden
 
     def log_lines(
         self,
@@ -326,7 +360,7 @@ class ViewerGL(ViewerBase):
 
     def _render_picking_line(self, state):
         """
-        Render a line from the mouse cursor to the center of mass of the picked body.
+        Render a line from the mouse cursor to the actual picked point on the geometry.
 
         Args:
             state: The current simulation state.
@@ -342,20 +376,13 @@ class ViewerGL(ViewerBase):
             self.log_lines("picking_line", None, None, None)
             return
 
-        # Get the pick target
+        # Get the pick target and current picked point on geometry
         pick_state = self.picking.pick_state.numpy()
-        pick_target = wp.vec3(pick_state[3], pick_state[4], pick_state[5])
-
-        # Get the body's COM position
-        body_transforms = state.body_q.numpy()
-        if pick_body_idx >= len(body_transforms):
-            self.log_lines("picking_line", None, None, None)
-            return
-        body_transform = body_transforms[pick_body_idx]
-        com_position = wp.vec3(body_transform[0], body_transform[1], body_transform[2])
+        pick_target = wp.vec3(pick_state[8], pick_state[9], pick_state[10])
+        picked_point = wp.vec3(pick_state[11], pick_state[12], pick_state[13])
 
         # Create line data
-        starts = wp.array([com_position], dtype=wp.vec3, device=self.device)
+        starts = wp.array([picked_point], dtype=wp.vec3, device=self.device)
         ends = wp.array([pick_target], dtype=wp.vec3, device=self.device)
         colors = wp.array([wp.vec3(0.0, 1.0, 1.0)], dtype=wp.vec3, device=self.device)
 
@@ -384,10 +411,6 @@ class ViewerGL(ViewerBase):
         whether an exit was requested and early-out before touching GL if so.
         """
         self._update()
-
-        # continue running the viewer update while the simulation is paused
-        while self.is_paused():
-            self._update()
 
     def apply_forces(self, state):
         """
@@ -780,7 +803,7 @@ class ViewerGL(ViewerBase):
 
     def _render_ui(self):
         """
-        Render the complete ImGui interface (left panel and stats overlay).
+        Render the complete ImGui interface (left panel, stats overlay, and custom UI).
         """
         if not self.ui.is_available:
             return
@@ -793,6 +816,10 @@ class ViewerGL(ViewerBase):
 
         # Render top-right stats overlay
         self._render_stats_overlay()
+
+        # allow users to create custom windows
+        for callback in self._ui_callbacks["free"]:
+            callback(self.ui.imgui)
 
     def _render_left_panel(self):
         """
@@ -820,15 +847,12 @@ class ViewerGL(ViewerBase):
             # Model Information section
             if self.model is not None:
                 imgui.set_next_item_open(True, imgui.Cond_.appearing)
-                _open = imgui.collapsing_header("Model Information", flags=header_flags)
-                if isinstance(_open, tuple):
-                    _open = _open[0]
-                if _open:
+                if imgui.collapsing_header("Model Information", flags=header_flags):
                     imgui.separator()
                     imgui.text(f"Environments: {self.model.num_envs}")
                     axis_names = ["X", "Y", "Z"]
                     imgui.text(f"Up Axis: {axis_names[self.model.up_axis]}")
-                    gravity = self.model.gravity
+                    gravity = self.model.gravity.numpy()[0]
                     gravity_text = f"Gravity: ({gravity[0]:.2f}, {gravity[1]:.2f}, {gravity[2]:.2f})"
                     imgui.text(gravity_text)
 
@@ -837,10 +861,7 @@ class ViewerGL(ViewerBase):
 
                 # Visualization Controls section
                 imgui.set_next_item_open(True, imgui.Cond_.appearing)
-                _open = imgui.collapsing_header("Visualization", flags=header_flags)
-                if isinstance(_open, tuple):
-                    _open = _open[0]
-                if _open:
+                if imgui.collapsing_header("Visualization", flags=header_flags):
                     imgui.separator()
 
                     # Joint visualization
@@ -875,12 +896,23 @@ class ViewerGL(ViewerBase):
                     show_triangles = self.show_triangles
                     changed, self.show_triangles = imgui.checkbox("Show Cloth", show_triangles)
 
+                    # Collision geometry toggle
+                    show_collision = self.show_collision
+                    changed, self.show_collision = imgui.checkbox("Show Collision", show_collision)
+
+                    # Visual geometry toggle
+                    show_visual = self.show_visual
+                    changed, self.show_visual = imgui.checkbox("Show Visual", show_visual)
+
+            imgui.set_next_item_open(True, imgui.Cond_.appearing)
+            if imgui.collapsing_header("Example Options"):
+                # Render UI callbacks for side panel
+                for callback in self._ui_callbacks["side"]:
+                    callback(self.ui.imgui)
+
             # Rendering Options section
             imgui.set_next_item_open(True, imgui.Cond_.appearing)
-            _open = imgui.collapsing_header("Rendering Options")
-            if isinstance(_open, tuple):
-                _open = _open[0]
-            if _open:
+            if imgui.collapsing_header("Rendering Options"):
                 imgui.separator()
 
                 # VSync
@@ -906,10 +938,7 @@ class ViewerGL(ViewerBase):
 
             # Wind Effects section
             imgui.set_next_item_open(False, imgui.Cond_.once)
-            _open = imgui.collapsing_header("Wind")
-            if isinstance(_open, tuple):
-                _open = _open[0]
-            if _open:
+            if imgui.collapsing_header("Wind"):
                 imgui.separator()
 
                 # Wind amplitude slider
@@ -935,10 +964,7 @@ class ViewerGL(ViewerBase):
 
             # Camera Information section
             imgui.set_next_item_open(True, imgui.Cond_.appearing)
-            _open = imgui.collapsing_header("Camera")
-            if isinstance(_open, tuple):
-                _open = _open[0]
-            if _open:
+            if imgui.collapsing_header("Camera"):
                 imgui.separator()
 
                 pos = self.camera.pos
@@ -1031,6 +1057,10 @@ class ViewerGL(ViewerBase):
             imgui.separator()
             imgui.text(f"Unique Objects: {len(self.objects)}")
 
+        # Custom stats
+        for callback in self._ui_callbacks["stats"]:
+            callback(self.ui.imgui)
+
         imgui.end()
 
         # Restore bg color if we pushed it
@@ -1046,10 +1076,7 @@ class ViewerGL(ViewerBase):
         # Selection Panel section
         header_flags = 0
         imgui.set_next_item_open(False, imgui.Cond_.appearing)  # Default to closed
-        _open = imgui.collapsing_header("Selection API", flags=header_flags)
-        if isinstance(_open, tuple):
-            _open = _open[0]
-        if _open:
+        if imgui.collapsing_header("Selection API", flags=header_flags):
             imgui.separator()
 
             # Check if we have state data available

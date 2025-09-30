@@ -64,7 +64,7 @@ def compute_ee_delta(
     rot_des = wp.transform_get_rotation(target)
     ang_diff = rot_des * wp.quat_inverse(rot)
     # compute pose difference between end effector and target
-    ee_delta[env_id] = wp.spatial_vector(ang_diff[0], ang_diff[1], ang_diff[2], pos_diff[0], pos_diff[1], pos_diff[2])
+    ee_delta[env_id] = wp.spatial_vector(pos_diff[0], pos_diff[1], pos_diff[2], ang_diff[0], ang_diff[1], ang_diff[2])
 
 
 def compute_body_jacobian(
@@ -518,7 +518,7 @@ class Example:
                 particle_count = self.model.particle_count
                 # set particle_count = 0 to circumvent
                 self.model.particle_count = 0
-                self.model.gravity = wp.vec3(0)
+                self.model.set_gravity((0.0, 0.0, 0.0))
 
                 # Update the robot pose - this will modify state_0 and copy to state_1
                 self.model.shape_contact_pair_count = 0
@@ -530,7 +530,7 @@ class Example:
                 self.state_0.particle_f.zero_()
 
                 self.model.particle_count = particle_count
-                self.model.gravity = wp.vec3(0, 0, self.gravity)
+                self.model.set_gravity((0.0, 0.0, self.gravity))
 
             # cloth sim
             self.contacts = self.model.collide(self.state_0, soft_contact_margin=self.cloth_body_contact_margin)
