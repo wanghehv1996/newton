@@ -64,7 +64,8 @@ class Example:
             # lift2 urdf can be downloaded from https://gitee.pjlab.org.cn/L2/wanghui1/PulseAsset.git
             newton.examples.get_asset("lift2_urdf/robot.urdf"),
             floating=False,
-            enable_self_collisions=False
+            enable_self_collisions=False,
+            xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.17))
         )
         franka.add_ground_plane()
 
