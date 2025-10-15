@@ -32,6 +32,10 @@ import newton.examples
 import newton.ik as ik
 import newton.utils
 
+import io_util
+from trajectory_animation import KeyFrameTrajectoryAnimation
+
+
 def limit_joint_move(tar_q, cur_q, max_qd, dt):
     err = tar_q-cur_q
     max_qd = max_qd*dt
@@ -63,6 +67,7 @@ def transform_diff(tf1, tf2, pos_thres=1e-3, rot_thres=1e-3):
 def linear_map(theta, lo, hi):
     return lo + theta*(hi-lo)
 
+
 from enum import IntEnum
 
 class GripperControlType(IntEnum):
@@ -79,26 +84,46 @@ class GripperControlType(IntEnum):
     TARGET_VELOCITY = 2
     """Control the gripper finger by setting the target velocity."""
 
+class AnimationType(IntEnum):
+    """
+    Flags for robot animation controlling.
+    """
+
+    INTERACTIVE = 0
+    """Interactive control with gizmo."""
+
+    TRAJECTORY = 1
+    """Trajectory control."""
+
 class Example:
     def __init__(self, viewer):
         # frame timing
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
+        self.sim_frame = 0
         self.sim_substeps = 10
         self.sim_dt = self.frame_dt / self.sim_substeps
 
-        self.gripper_control_type = GripperControlType.TARGET_POSITION
-        # self.gripper_control_type = GripperControlType.TARGET_VELOCITY
+        # self.gripper_control_type = GripperControlType.TARGET_POSITION
+        self.gripper_control_type = GripperControlType.TARGET_VELOCITY
 
         # TODO: 
         self.use_mujoco_cpu = True
         # self.use_mujoco_cpu = True  # Use MuJoCo-CPU (stable cube grasp)
         # self.use_mujoco_cpu = False # Use MuJoCo-Warp (friction still inaccurate)
 
+        self.animation_type = AnimationType.TRAJECTORY
+        # self.animation_type = AnimationType.INTERACTIVE
+
+        self.use_dump_image = False
 
         # VBD parameters
-        self.sim_vbd_iterations = 7
+        if self.animation_type == AnimationType.INTERACTIVE:
+            self.sim_vbd_iterations = 3    
+        if self.animation_type == AnimationType.TRAJECTORY:
+            self.sim_vbd_iterations = 7
+        # self.sim_vbd_iterations = 3
         #       body-cloth contact
         self.cloth_particle_radius = 0.008
         self.cloth_body_contact_margin = 0.01
@@ -175,7 +200,7 @@ class Example:
         self.robot_gripper_joint_idxs = (12,13,20,21) # gripper
         for i in self.robot_gripper_joint_idxs:
             # Leave a small gap to avoid penetration
-            franka.joint_limit_lower[i] = 0.005
+            franka.joint_limit_lower[i] = 0.002
             # franka.joint_limit_upper[i] = 0.04
 
             # Configure target control for gripper joints
@@ -193,12 +218,12 @@ class Example:
         
         # Set indices for the end-effector and fingers
         self.lee_index = 9  # left gripper end effector body index
-        self.lee_lf_index = 12 # left finger joint index
-        self.lee_rf_index = 13 # right finger joint index
+        self.lee_lf_index = 20 # left finger joint index
+        self.lee_rf_index = 21 # right finger joint index
 
         self.ree_index = 18  # right gripper end effector body index
-        self.ree_lf_index = 20 # left finger joint index
-        self.ree_rf_index = 21 # right finger joint index
+        self.ree_lf_index = 12 # left finger joint index
+        self.ree_rf_index = 13 # right finger joint index
 
         self.controllable_joints_cnt = self.robot_joint_q_cnt
 
@@ -250,7 +275,7 @@ class Example:
             vertices=vertices,
             indices=mesh_indices,
             rot=wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), np.pi*0.5),
-            pos=wp.vec3(1.0, 0.00, 0.55),
+            pos=wp.vec3(0.7, 0.00, 0.5),
             vel=wp.vec3(0.0, 0.0, 0.0),
             density=0.2,
             scale=0.01,
@@ -284,6 +309,10 @@ class Example:
         # Viewer
         self.viewer.set_model(self.model)
         self.viewer.vsync = True
+        if isinstance(self.viewer, newton.viewer.ViewerGL):
+            pos = type(self.viewer.camera.pos)(3.0, 0, 1.4)
+            self.viewer.camera.pos = pos
+            self.viewer.camera.pitch = -20
 
         # States
         self.state = self.model.state() # for IKSolver
@@ -365,6 +394,11 @@ class Example:
         self.ik_joint_q = wp.array(self.model.joint_q, shape=(1, self.model.joint_coord_count))
         self.ik_joint_qd = wp.array(self.model.joint_qd, shape=(self.model.joint_dof_count))
         self.ik_iters = 24
+
+        # trajectory animation
+        # TODO: better API
+        self.trajectory_animation = KeyFrameTrajectoryAnimation()
+        self.trajectory_animation.init_lift2_folding()
 
         # ------------------------------------------------------------------
         # Solvers
@@ -484,17 +518,6 @@ class Example:
         q = wp.transform_get_rotation(self.ree_tf)
         self.r_rot_obj.set_target_rotation(0, wp.vec4(q[0], q[1], q[2], q[3]))
 
-
-        print(f"Left  end effector:{self.lee_tf}")
-        print(f"Right end effector:{self.ree_tf}")
-
-    # ----------------------------------------------------------------------
-    # Template API
-    # ----------------------------------------------------------------------
-    def step(self):
-        self.sim_time += self.frame_dt
-        self._push_targets_from_gizmos()
-
         if hasattr(self.viewer, "is_key_down"):
             if self.viewer.is_key_down("1"):
                 self.open_left_gripper = 0
@@ -505,6 +528,41 @@ class Example:
                 self.open_right_gripper = 0
             else:
                 self.open_right_gripper = 1
+
+        print(f"Left  end effector:{self.lee_tf}")
+        print(f"Right end effector:{self.ree_tf}")
+
+    def _push_targets_from_trajectories(self):
+        """Read transform from trajectory and push into IK objectives."""
+        
+        transform, state = self.trajectory_animation.get_pose("left_gripper", self.sim_time)
+        transform = wp.transform(*transform)
+        self.l_pos_obj.set_target_position(0, wp.transform_get_translation(transform))
+        q = wp.transform_get_rotation(transform)
+        self.l_rot_obj.set_target_rotation(0, wp.vec4(q[0], q[1], q[2], q[3]))
+        self.open_left_gripper = state
+
+        print(transform, state)
+
+        transform, state = self.trajectory_animation.get_pose("right_gripper", self.sim_time)
+        transform = wp.transform(*transform)
+        self.r_pos_obj.set_target_position(0, wp.transform_get_translation(transform))
+        q = wp.transform_get_rotation(transform)
+        self.r_rot_obj.set_target_rotation(0, wp.vec4(q[0], q[1], q[2], q[3]))
+        self.open_right_gripper = state
+
+
+    # ----------------------------------------------------------------------
+    # Template API
+    # ----------------------------------------------------------------------
+    def step(self):
+
+        if self.animation_type == AnimationType.INTERACTIVE:
+            self._push_targets_from_gizmos()
+
+        if self.animation_type == AnimationType.TRAJECTORY:
+            self._push_targets_from_trajectories()
+
 
         # IK step, update self.ik_joint_q as the target pose
         if self.ik_graph:
@@ -609,6 +667,7 @@ class Example:
             self.physics_simulate()
 
         self.sim_time += self.frame_dt
+        self.sim_frame += 1
 
     def test(self):
         pass
@@ -616,9 +675,10 @@ class Example:
     def render(self):
         self.viewer.begin_frame(self.sim_time)
 
-        # Register gizmo (viewer will draw & mutate transform in-place)
-        self.viewer.log_gizmo("left_target_tcp", self.lee_tf)
-        self.viewer.log_gizmo("right_target_tcp", self.ree_tf)
+        if self.animation_type == AnimationType.INTERACTIVE:
+            # Register gizmo (viewer will draw & mutate transform in-place)
+            self.viewer.log_gizmo("left_target_tcp", self.lee_tf)
+            self.viewer.log_gizmo("right_target_tcp", self.ree_tf)
         # self.viewer.log_state(self.state)
         self.viewer.log_state(self.state_0)
 
@@ -626,6 +686,9 @@ class Example:
         self.viewer.end_frame()
 
         wp.synchronize()
+
+        if self.use_dump_image:
+            io_util.dump_gl_frame_image(self.viewer.renderer._screen_width,self.viewer.renderer._screen_height,f"img_{self.sim_frame}.png")
 
 if __name__ == "__main__":
     viewer, args = newton.examples.init()

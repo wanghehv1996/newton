@@ -34,6 +34,8 @@ import newton.utils
 from warp.sim.utils import load_mesh
 from warp.sim.render import SimRendererUsd
 
+import io_util
+
 def limit_joint_move(tar_q, cur_q, max_qd, dt):
     err = tar_q-cur_q
     max_qd = max_qd*dt
@@ -87,6 +89,7 @@ class Example:
         self.fps = 120
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
+        self.sim_frame = 0
         self.sim_substeps = 10
         self.sim_dt = self.frame_dt / self.sim_substeps
 
@@ -97,6 +100,8 @@ class Example:
         self.use_mujoco_cpu = True
         # self.use_mujoco_cpu = True  # Use MuJoCo-CPU (stable cube grasp)
         # self.use_mujoco_cpu = False # Use MuJoCo-Warp (friction still inaccurate)
+
+        self.use_dump_image = False
 
         self.viewer = viewer
 
@@ -246,6 +251,10 @@ class Example:
         # Viewer
         self.viewer.set_model(self.model)
         self.viewer.vsync = True
+        if isinstance(self.viewer, newton.viewer.ViewerGL):
+            pos = type(self.viewer.camera.pos)(3.0, 0, 1.4)
+            self.viewer.camera.pos = pos
+            self.viewer.camera.pitch = -20
 
         # States
         self.state = self.model.state() # for IKSolver
@@ -426,7 +435,6 @@ class Example:
     # Template API
     # ----------------------------------------------------------------------
     def step(self):
-        self.sim_time += self.frame_dt
         self._push_targets_from_gizmos()
 
         if hasattr(self.viewer, "is_key_down"):
@@ -547,6 +555,7 @@ class Example:
         # self.renderer.end_frame()
 
         self.sim_time += self.frame_dt
+        self.sim_frame += 1
         
         # if self.sim_time > 10:
         #     self.usd_viewer.close()
@@ -571,6 +580,8 @@ class Example:
         # self.usd_viewer.end_frame()
 
         wp.synchronize()
+        if self.use_dump_image:
+            io_util.dump_gl_frame_image(self.viewer.renderer._screen_width,self.viewer.renderer._screen_height,f"img_{self.sim_frame}.png")
 
 if __name__ == "__main__":
     # parser = newton.examples.create_parser()
