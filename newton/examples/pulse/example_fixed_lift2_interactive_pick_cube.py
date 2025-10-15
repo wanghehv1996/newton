@@ -31,6 +31,9 @@ import newton.examples
 import newton.ik as ik
 import newton.utils
 
+from warp.sim.utils import load_mesh
+from warp.sim.render import SimRendererUsd
+
 import io_util
 
 def limit_joint_move(tar_q, cur_q, max_qd, dt):
@@ -83,7 +86,7 @@ class GripperControlType(IntEnum):
 class Example:
     def __init__(self, viewer):
         # frame timing
-        self.fps = 60
+        self.fps = 120
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
         self.sim_frame = 0
@@ -184,26 +187,54 @@ class Example:
         # Add other objects
         # ------------------------------------------------------------------
 
+        # MESH (basket)
+        [mesh_vertices, mesh_indices] = load_mesh(newton.examples.get_asset("fruits/plate.obj"))
+        mesh_basket = newton.Mesh(mesh_vertices, mesh_indices)
+        body_mesh_basket = franka.add_body(xform=wp.transform(p=wp.vec3(0.65, 0, 0.55)))
+        franka.add_joint_free(body_mesh_basket)
+        franka.add_shape_mesh(body_mesh_basket, mesh = mesh_basket, cfg=newton.ModelBuilder.ShapeConfig(density=710.0))
+
+        franka.approximate_meshes("coacd")
+
         # Add a fixed table
-        pos = wp.vec3(0.8, 0.0, 0.201)
+        pos = wp.vec3(0.7, 0.0, 0.201)
         rot = wp.quat_identity()
         body_table = franka.add_body()
         franka.add_joint_fixed(-1, body_table)
-        franka.add_shape_box(body_table, xform=wp.transform(p=pos, q=rot), hx=0.4, hy=0.4, hz=0.2)
-        # franka.add_shape_cylinder(body_table, xform=wp.transform(p=pos, q=rot), radius=0.4, half_height=0.2)
+        franka.add_shape_box(body_table, xform=wp.transform(p=pos, q=rot), hx=0.4, hy=0.8, hz=0.15)
 
-        # Add a box
-        pos = wp.vec3(0.6, 0.0, 0.43)
-        rot = wp.quat_identity()
-        body_box = franka.add_body(xform=wp.transform(p=pos, q=rot))
-        franka.add_joint_free(body_box)
-        franka.add_shape_box(body_box, hx=0.03, hy=0.03, hz=0.03, cfg=newton.ModelBuilder.ShapeConfig(density=100.0))
+        # MESH (carrot)
+        [mesh_vertices, mesh_indices] = load_mesh(newton.examples.get_asset("fruits/SM_CarrotA_Carrot_0/SM_CarrotA_Carrot_0.obj"))
+        mesh_carrot = newton.Mesh(mesh_vertices, mesh_indices)
+        body_mesh_carrot = franka.add_body(xform=wp.transform(p=wp.vec3(0.55, 0.45, 0.55)))
+        franka.add_joint_free(body_mesh_carrot)
+        franka.add_shape_mesh(body_mesh_carrot, mesh = mesh_carrot, cfg=newton.ModelBuilder.ShapeConfig(density=710.0))
 
-        # Set friction
+        # MESH (bellpepper)
+        [mesh_vertices, mesh_indices] = load_mesh(newton.examples.get_asset("fruits/SM_KingOysterMushroom_KingOysterMushroom_0/SM_KingOysterMushroom_KingOysterMushroom_0.obj"))
+        mesh_bellpepper = newton.Mesh(mesh_vertices, mesh_indices)
+        body_mesh_bellpepper = franka.add_body(xform=wp.transform(p=wp.vec3(0.6, 0.3, 0.45)))
+        franka.add_joint_free(body_mesh_bellpepper)
+        franka.add_shape_mesh(body_mesh_bellpepper, mesh = mesh_bellpepper, cfg=newton.ModelBuilder.ShapeConfig(density=710.0))
+
+        # MESH (broccoli)
+        [mesh_vertices, mesh_indices] = load_mesh(newton.examples.get_asset("fruits/SM_Eggplant_Eggplant_0/SM_Eggplant_Eggplant_0.obj"))
+        mesh_broccoli = newton.Mesh(mesh_vertices, mesh_indices)
+        body_mesh_broccoli = franka.add_body(xform=wp.transform(p=wp.vec3(0.65, -0.3, 0.45)))
+        franka.add_joint_free(body_mesh_broccoli)
+        franka.add_shape_mesh(body_mesh_broccoli, mesh = mesh_broccoli, cfg=newton.ModelBuilder.ShapeConfig(density=710.0))
+
+        # # Add a box
+        # pos = wp.vec3(0.6, 0.0, 0.43)
+        # rot = wp.quat_identity()
+        # body_box = franka.add_body(xform=wp.transform(p=pos, q=rot))
+        # franka.add_joint_free(body_box)
+        # franka.add_shape_box(body_box, hx=0.03, hy=0.03, hz=0.03, cfg=newton.ModelBuilder.ShapeConfig(density=100.0))
+
+        # # Set friction
         for i in range(len(franka.shape_material_mu)):
             franka.shape_material_mu[i] = 1.0
-            franka.shape_material_ka[i] = 0.002
-            franka.shape_is_solid[i] = True
+            franka.shape_material_kd[i] = 1.0e8
 
         # ------------------------------------------------------------------
         # Finalization and initialization of computational components
@@ -334,6 +365,9 @@ class Example:
         )
 
         self.capture()
+
+        # self.usd_viewer = newton.viewer.ViewerUSD(output_path="fruits.usd")
+        # self.usd_viewer.set_model(self.model)
 
     # ----------------------------------------------------------------------
     # Helpers
@@ -516,8 +550,15 @@ class Example:
         else:
             self.physics_simulate()
 
+        # self.renderer.begin_frame(self.sim_time)
+        # self.renderer.render(self.state_0)
+        # self.renderer.end_frame()
+
         self.sim_time += self.frame_dt
         self.sim_frame += 1
+        
+        # if self.sim_time > 10:
+        #     self.usd_viewer.close()
 
     def test(self):
         pass
@@ -534,11 +575,19 @@ class Example:
         self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
 
+        # self.usd_viewer.begin_frame(self.sim_time)
+        # self.usd_viewer.log_state(self.state_0)
+        # self.usd_viewer.end_frame()
+
         wp.synchronize()
         if self.use_dump_image:
             io_util.dump_gl_frame_image(self.viewer.renderer._screen_width,self.viewer.renderer._screen_height,f"img_{self.sim_frame}.png")
 
 if __name__ == "__main__":
+    # parser = newton.examples.create_parser()
+    # parser.set_defaults(viewer="usd", output_path="cloth_bending.usd")
+    # viewer, args = newton.examples.init(parser)
+
     viewer, args = newton.examples.init()
     example = Example(viewer)
     newton.examples.run(example)
