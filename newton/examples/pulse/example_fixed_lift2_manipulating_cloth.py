@@ -117,6 +117,7 @@ class Example:
         # self.animation_type = AnimationType.INTERACTIVE
 
         self.use_dump_image = False
+        # self.use_dump_image = True
 
         # VBD parameters
         if self.animation_type == AnimationType.INTERACTIVE:
@@ -200,7 +201,7 @@ class Example:
         self.robot_gripper_joint_idxs = (12,13,20,21) # gripper
         for i in self.robot_gripper_joint_idxs:
             # Leave a small gap to avoid penetration
-            franka.joint_limit_lower[i] = 0.002
+            franka.joint_limit_lower[i] = 0.005
             # franka.joint_limit_upper[i] = 0.04
 
             # Configure target control for gripper joints
@@ -532,6 +533,12 @@ class Example:
         print(f"Left  end effector:{self.lee_tf}")
         print(f"Right end effector:{self.ree_tf}")
 
+        # self.cloth_solver.finger_indices.assign([self.open_left_gripper, self.open_left_gripper, self.open_right_gripper, self.open_right_gripper])
+
+        # self.cloth_solver.finger_states.assign([self.open_left_gripper, self.open_left_gripper, self.open_right_gripper, self.open_right_gripper])
+
+        # print(self.cloth_solver.finger_states)
+
     def _push_targets_from_trajectories(self):
         """Read transform from trajectory and push into IK objectives."""
         
@@ -551,6 +558,10 @@ class Example:
         self.r_rot_obj.set_target_rotation(0, wp.vec4(q[0], q[1], q[2], q[3]))
         self.open_right_gripper = state
 
+
+        # self.cloth_solver.finger_states.assign([self.open_right_gripper, self.open_right_gripper, self.open_left_gripper, self.open_left_gripper])
+
+        # print(self.cloth_solver.finger_states, self.cloth_solver.finger_indices)
 
     # ----------------------------------------------------------------------
     # Template API
