@@ -679,6 +679,7 @@ class Example:
 
         self.sim_time += self.frame_dt
         self.sim_frame += 1
+        print(f"frame {self.sim_frame}, time {self.sim_time}")
 
     def test(self):
         pass
@@ -702,6 +703,9 @@ class Example:
             io_util.dump_gl_frame_image(self.viewer.renderer._screen_width,self.viewer.renderer._screen_height,f"img_{self.sim_frame}.png")
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+
+    parser = newton.examples.create_parser()
+    parser.set_defaults(viewer="usd", output_path="lift2_manipulating_cloth.usd", num_frames=60*31)
+    viewer, args = newton.examples.init(parser)
     example = Example(viewer)
     newton.examples.run(example)
