@@ -702,6 +702,10 @@ class Example:
             io_util.dump_gl_frame_image(self.viewer.renderer._screen_width,self.viewer.renderer._screen_height,f"img_{self.sim_frame}.png")
 
 if __name__ == "__main__":
+    # parser = newton.examples.create_parser()
+    # parser.set_defaults(num_frames=50, viewer="usd", output_path="cloth_bending.usd")
+    # viewer, args = newton.examples.init(parser)
+
     viewer, args = newton.examples.init()
     example = Example(viewer)
-    newton.examples.run(example)
+    newton.examples.run(example, args)
