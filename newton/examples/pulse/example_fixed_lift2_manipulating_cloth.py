@@ -95,6 +95,29 @@ class AnimationType(IntEnum):
     TRAJECTORY = 1
     """Trajectory control."""
 
+# config the joint types
+fixed_joint_names = {
+    "fixed_base", 
+    "root_joint", 
+    "fl_fixed_joint",
+    "fr_fixed_joint",
+}
+controllable_joint_names = {
+    "joint4",
+    "fl_joint1", "fl_joint2", "fl_joint3", "fl_joint4", "fl_joint5", "fl_joint6", 
+    "fr_joint1", "fr_joint2", "fr_joint3", "fr_joint4", "fr_joint5", "fr_joint6", 
+}
+gripper_joint_names = {
+    "fl_joint7", "fl_joint8",
+    "fr_joint7", "fr_joint8",
+}
+
+left_ee_body_names = {"fl_link6"}
+left_gripper_joint_names = {"fl_joint7", "fl_joint8",}
+right_ee_body_names = {"fr_link6"}
+right_gripper_joint_names = {"fr_joint7", "fr_joint8",}
+
+
 class Example:
     def __init__(self, viewer):
         # frame timing
@@ -165,18 +188,61 @@ class Example:
         franka.add_ground_plane()
 
         # ------------------------------------------------------------------
-        # Print debug info
+        # Set joint groups, print debug info
         # ------------------------------------------------------------------
         cnt = 0
+
+        # body information
         print("=== Body Information ===")
         for i in range(franka.body_count):
             print(f"body {i}, key={franka.body_key[i]}")
+            # set left end effector
+            if franka.body_key[i] in left_ee_body_names:
+                self.lee_index = i
+                print(f"  >> left end-effector")
+            # set right end effector
+            if franka.body_key[i] in right_ee_body_names:
+                self.ree_index = i
+                print(f"  >> right end-effector")
+
+        # joint information
         print("=== Joint Information ===")
         print(f"#joint_dof={franka.joint_dof_count}, #joint_coord = {franka.joint_coord_count}")
+        # joint groups
+        self.fixed_joint_indices = np.array([], dtype = int)
+        self.controllable_joint_indices = np.array([], dtype = int)
+        self.left_gripper_joint_indices = np.array([], dtype = int)
+        self.right_gripper_joint_indices = np.array([], dtype = int)
+
         for i in range(franka.joint_count):
             print(f"joint {i}, key={franka.joint_key[i]}, type={franka.joint_type[i]}, link={franka.joint_parent[i]} -> {franka.joint_child[i]}, dof_dim={franka.joint_dof_dim[i]}, dof_start {cnt}, dof_lim = [{franka.joint_limit_lower[cnt]}, {franka.joint_limit_upper[cnt]}]")
+
+            dof_start = cnt
+            dof_end = cnt + franka.joint_dof_dim[i][0] + franka.joint_dof_dim[i][1]
+            # set fixed joint group
+            if franka.joint_key[i] in fixed_joint_names:
+                for j in range(dof_start, dof_end):
+                    self.fixed_joint_indices = np.append(self.fixed_joint_indices, [j])
+            # set controllable joint group
+            if franka.joint_key[i] in controllable_joint_names:
+                for j in range(dof_start, dof_end):
+                    self.controllable_joint_indices = np.append(self.controllable_joint_indices, [j])
+            # set left gripper joint group
+            if franka.joint_key[i] in left_gripper_joint_names:
+                for j in range(dof_start, dof_end):
+                    self.left_gripper_joint_indices = np.append(self.left_gripper_joint_indices, [j])
+            # set right gripper joint group
+            if franka.joint_key[i] in right_gripper_joint_names:
+                for j in range(dof_start, dof_end):
+                    self.right_gripper_joint_indices = np.append(self.right_gripper_joint_indices, [j])
+
             cnt += franka.joint_dof_dim[i][0] + franka.joint_dof_dim[i][1]
+
         print(f"joint dq cnt check: {cnt} == {franka.joint_dof_count}")
+        print("fixed joint", self.fixed_joint_indices)
+        print("controllable joint", self.controllable_joint_indices)
+        print("left joint", self.left_gripper_joint_indices)
+        print("right joint", self.right_gripper_joint_indices)
 
 
         # ------------------------------------------------------------------
@@ -185,21 +251,19 @@ class Example:
         self.robot_joint_q_cnt = len(franka.joint_q)
         
         # Configure target position control for arm joints.
-        for i in range(self.robot_joint_q_cnt):
+        for i in self.controllable_joint_indices:
             franka.joint_dof_mode[i] = newton.JointMode.TARGET_POSITION
             franka.joint_target_ke[i] = 3000.0
             franka.joint_target_kd[i] = 10.0
 
-        # Remove control for the base
-        self.robot_fix_joint_idxs = (0,1,2,4,5) # wheels and camera
-        for i in self.robot_fix_joint_idxs:
+        # Remove control for the fixed joints
+        for i in self.fixed_joint_indices:
             franka.joint_dof_mode[i] = newton.JointMode.NONE
             franka.joint_limit_lower[i] = 0
             franka.joint_limit_upper[i] = 0
 
         # Configure control for the gripper
-        self.robot_gripper_joint_idxs = (12,13,20,21) # gripper
-        for i in self.robot_gripper_joint_idxs:
+        for i in np.concatenate((self.left_gripper_joint_indices, self.right_gripper_joint_indices)):
             # Leave a small gap to avoid penetration
             franka.joint_limit_lower[i] = 0.005
             # franka.joint_limit_upper[i] = 0.04
@@ -217,17 +281,6 @@ class Example:
                 franka.joint_dof_mode[i] = newton.JointMode.TARGET_VELOCITY
                 franka.joint_target_kd[i] = 10.0
         
-        # Set indices for the end-effector and fingers
-        self.lee_index = 9  # left gripper end effector body index
-        self.lee_lf_index = 20 # left finger joint index
-        self.lee_rf_index = 21 # right finger joint index
-
-        self.ree_index = 18  # right gripper end effector body index
-        self.ree_lf_index = 12 # left finger joint index
-        self.ree_rf_index = 13 # right finger joint index
-
-        self.controllable_joints_cnt = self.robot_joint_q_cnt
-
         # ------------------------------------------------------------------
         # Add other objects
         # ------------------------------------------------------------------
@@ -491,24 +544,6 @@ class Example:
             # swap state
             (self.state_0, self.state_1) = (self.state_1, self.state_0)
 
-    def update_control(self):
-
-        # Manually reset q for [wheel] and [camera]
-        # ik_joint_q = self.ik_joint_q.flatten()
-        # self.state_0.joint_q[0:3].assign(ik_joint_q[0:3]*0.0) # wheel
-        # self.state_0.joint_q[4:6].assign(ik_joint_q[4:6]*0.0) # camera
-
-        # Reset qd for [lift] and [arm]
-        self.state_0.joint_qd[3:4].assign(self.ik_joint_qd[3:4]) # lift
-        self.state_0.joint_qd[6:12].assign(self.ik_joint_qd[6:12]) # arm
-        self.state_0.joint_qd[14:20].assign(self.ik_joint_qd[14:20]) # arm
-
-        # Reset qd for [gripper]
-        if self.gripper_control_type == GripperControlType.TARGET_POSITION:
-            self.ik_joint_qd[self.lee_lf_index:self.lee_rf_index+1].assign(self.ik_joint_qd[self.lee_lf_index:self.lee_rf_index+1])
-            self.ik_joint_qd[self.ree_lf_index:self.ree_rf_index+1].assign(self.ik_joint_qd[self.ree_lf_index:self.ree_rf_index+1])
-
-
     def _push_targets_from_gizmos(self):
         """Read gizmo-updated transform and push into IK objectives."""
         self.l_pos_obj.set_target_position(0, wp.transform_get_translation(self.lee_tf))
@@ -549,8 +584,6 @@ class Example:
         self.l_rot_obj.set_target_rotation(0, wp.vec4(q[0], q[1], q[2], q[3]))
         self.open_left_gripper = state
 
-        print(transform, state)
-
         transform, state = self.trajectory_animation.get_pose("right_gripper", self.sim_time)
         transform = wp.transform(*transform)
         self.r_pos_obj.set_target_position(0, wp.transform_get_translation(transform))
@@ -582,94 +615,61 @@ class Example:
             self.ik_simulate()
 
         ik_joint_q = self.ik_joint_q.flatten()
+        ik_joint_q_np = ik_joint_q.numpy()
+
+
+        # Position control for [gripper]
+        joint_limit_lower_np = self.model.joint_limit_lower.numpy()
+        joint_limit_upper_np = self.model.joint_limit_upper.numpy()
+        if self.gripper_control_type == GripperControlType.TARGET_POSITION:
+            if self.open_left_gripper:
+                ik_joint_q_np[self.left_gripper_joint_indices] = joint_limit_upper_np[self.left_gripper_joint_indices]
+            else:
+                ik_joint_q_np[self.left_gripper_joint_indices] = joint_limit_lower_np[self.left_gripper_joint_indices]
+
+            if self.open_right_gripper:
+                ik_joint_q_np[self.right_gripper_joint_indices] = joint_limit_upper_np[self.right_gripper_joint_indices]
+            else:
+                ik_joint_q_np[self.right_gripper_joint_indices] = joint_limit_lower_np[self.right_gripper_joint_indices]
+
+        ik_joint_q.assign(ik_joint_q_np)
 
         # Align the self.state with the target body in the viewer
         newton.eval_fk(self.model, ik_joint_q, self.model.joint_qd, self.state)
         
         # Limit the joint movement in one frame
-        move, target = limit_joint_move(ik_joint_q[0:self.controllable_joints_cnt].numpy(), self.state_0.joint_q[0:self.controllable_joints_cnt].numpy(), 20.0, self.frame_dt)
+        move, target = limit_joint_move(ik_joint_q.numpy(), self.state_0.joint_q.numpy(), 20.0, self.frame_dt)
 
-        # Set target q control for [lift] and [arm]
-        self.control.joint_target[3:4].assign(target.flatten()[3:4]) # lift
-        self.control.joint_target[6:12].assign(target.flatten()[6:12]) # arm
-        self.control.joint_target[14:20].assign(target.flatten()[14:20]) # arm
+        # Set target q control for [controllable joint] and [gripper]
+        joint_target_np = self.control.joint_target.numpy()
+        joint_target_np[self.controllable_joint_indices] = target.flatten()[self.controllable_joint_indices]
+        if self.gripper_control_type == GripperControlType.TARGET_POSITION:
+            joint_target_np[self.left_gripper_joint_indices]=(target.flatten()[self.left_gripper_joint_indices])
+            joint_target_np[self.right_gripper_joint_indices]=(target.flatten()[self.right_gripper_joint_indices])
+        self.control.joint_target.assign(joint_target_np)
 
-        # Manually reset q for [wheel] and [camera]
-        # self.state_0.joint_q[0:3].assign(ik_joint_q[0:3]*0.0) # wheel
-        # self.state_0.joint_q[4:6].assign(ik_joint_q[4:6]*0.0) # camera
-
-        # Manually reset qd to stablize the simulation for [lift] and [arm]
-        self.ik_joint_qd[3:4].assign(move[3:4]/self.frame_dt) # lift
-        self.ik_joint_qd[6:12].assign(move[6:12]/self.frame_dt) # arm
-        self.ik_joint_qd[14:20].assign(move[14:20]/self.frame_dt) # arm
-        self.state_0.joint_qd[3:4].assign(move[3:4]/self.frame_dt) # lift
-        self.state_0.joint_qd[6:12].assign(move[6:12]/self.frame_dt) # arm
-        self.state_0.joint_qd[14:20].assign(move[14:20]/self.frame_dt) # arm
-
+        # Set joint qd for [controllable joint] and [gripper]
+        joint_qd_np = self.state_0.joint_qd.numpy()
+        ik_joint_qd_np = move/self.frame_dt
+        joint_qd_np[self.controllable_joint_indices] = ik_joint_qd_np[self.controllable_joint_indices]
+        if self.gripper_control_type == GripperControlType.TARGET_POSITION:
+            joint_qd_np[self.left_gripper_joint_indices]=(ik_joint_qd_np[self.left_gripper_joint_indices])
+            joint_qd_np[self.right_gripper_joint_indices]=(ik_joint_qd_np[self.right_gripper_joint_indices])
+        self.ik_joint_qd.assign(joint_qd_np)
+        self.state_0.joint_qd.assign(joint_qd_np)
 
         # Set joint velocity for the grippers
         gripper_vel = 0.2
 
-        # Position control for [gripper]
-        if self.gripper_control_type == GripperControlType.TARGET_POSITION:
-            
-            # left gripper
-            # Get IK target
-            ik_lf_q = self.model.joint_limit_lower[self.lee_lf_index:self.lee_lf_index+1]
-            ik_rf_q = self.model.joint_limit_lower[self.lee_rf_index:self.lee_rf_index+1]
-            if self.open_left_gripper:
-                ik_lf_q = self.model.joint_limit_upper[self.lee_lf_index:self.lee_lf_index+1]
-                ik_rf_q = self.model.joint_limit_upper[self.lee_rf_index:self.lee_rf_index+1]
-
-            ik_joint_q[self.lee_lf_index:self.lee_lf_index+1].assign(ik_lf_q)
-            ik_joint_q[self.lee_rf_index:self.lee_rf_index+1].assign(ik_rf_q)
-
-            # Get control signal
-            move, target = limit_joint_move(ik_joint_q[self.lee_lf_index:self.lee_rf_index+1].numpy(), self.state_0.joint_q[self.lee_lf_index:self.lee_rf_index+1].numpy(), gripper_vel, self.frame_dt)
-
-            # Set target q control and qd
-            self.control.joint_target[self.lee_lf_index:self.lee_rf_index+1].assign(target.flatten())
-            self.ik_joint_qd[self.lee_lf_index:self.lee_rf_index+1].assign(move/self.frame_dt)
-            self.state_0.joint_qd[self.lee_lf_index:self.lee_rf_index+1].assign(move/self.frame_dt)
-
-            # right gripper
-            # Get IK target
-            ik_lf_q = self.model.joint_limit_lower[self.ree_lf_index:self.ree_lf_index+1]
-            ik_rf_q = self.model.joint_limit_lower[self.ree_rf_index:self.ree_rf_index+1]
-            if self.open_right_gripper:
-                ik_lf_q = self.model.joint_limit_upper[self.ree_lf_index:self.ree_lf_index+1]
-                ik_rf_q = self.model.joint_limit_upper[self.ree_rf_index:self.ree_rf_index+1]
-
-            ik_joint_q[self.ree_lf_index:self.ree_lf_index+1].assign(ik_lf_q)
-            ik_joint_q[self.ree_rf_index:self.ree_rf_index+1].assign(ik_rf_q)
-
-            # Get control signal
-            move, target = limit_joint_move(ik_joint_q[self.ree_lf_index:self.ree_rf_index+1].numpy(), self.state_0.joint_q[self.ree_lf_index:self.ree_rf_index+1].numpy(), gripper_vel, self.frame_dt)
-
-            # Set target q control and qd
-            self.control.joint_target[self.ree_lf_index:self.ree_rf_index+1].assign(target.flatten())
-            self.ik_joint_qd[self.ree_lf_index:self.ree_rf_index+1].assign(move/self.frame_dt)
-            self.state_0.joint_qd[self.ree_lf_index:self.ree_rf_index+1].assign(move/self.frame_dt)
-
-
-        # Velocity control for [finger]
+        # Velocity control for [gripper]
         if self.gripper_control_type == GripperControlType.TARGET_VELOCITY:
+            joint_target_np = self.control.joint_target.numpy()
 
-            # left gripper
-            self.control.joint_target[self.lee_lf_index:self.lee_lf_index+1].assign([
-                linear_map(self.open_left_gripper, -gripper_vel, gripper_vel)
-            ])
-            self.control.joint_target[self.lee_rf_index:self.lee_rf_index+1].assign([
-                linear_map(self.open_left_gripper, -gripper_vel, gripper_vel),
-            ])
-
-            # right gripper
-            self.control.joint_target[self.ree_lf_index:self.ree_lf_index+1].assign([
-                linear_map(self.open_right_gripper, -gripper_vel, gripper_vel)
-            ])
-            self.control.joint_target[self.ree_rf_index:self.ree_rf_index+1].assign([
-                linear_map(self.open_right_gripper, -gripper_vel, gripper_vel),
-            ])
+            vel = linear_map(self.open_left_gripper, -gripper_vel, gripper_vel)
+            joint_target_np[self.left_gripper_joint_indices] = vel
+            vel = linear_map(self.open_right_gripper, -gripper_vel, gripper_vel)
+            joint_target_np[self.right_gripper_joint_indices] = vel
+            self.control.joint_target.assign(joint_target_np)
 
         # Physics step
         if self.physics_graph:
