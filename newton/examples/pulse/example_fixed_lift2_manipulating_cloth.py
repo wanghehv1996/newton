@@ -139,8 +139,12 @@ class Example:
         self.animation_type = AnimationType.TRAJECTORY
         # self.animation_type = AnimationType.INTERACTIVE
 
+        # dump visualization image sequence
         self.use_dump_image = False
         # self.use_dump_image = True
+
+        # dump joint q into .npz
+        self.use_dump_joint = False
 
         # VBD parameters
         if self.animation_type == AnimationType.INTERACTIVE:
@@ -244,6 +248,9 @@ class Example:
         print("left joint", self.left_gripper_joint_indices)
         print("right joint", self.right_gripper_joint_indices)
 
+        if self.use_dump_joint:
+            self.joint_q_seq = np.empty((0, franka.joint_dof_count), dtype=np.float32)
+            self.openness_seq = np.empty((0, 2), dtype=np.float32)
 
         # ------------------------------------------------------------------
         # Configurate joints
@@ -679,6 +686,15 @@ class Example:
 
         self.sim_time += self.frame_dt
         self.sim_frame += 1
+        
+        if self.use_dump_joint:
+            joint_q_np = self.state_0.joint_q.numpy()
+            self.joint_q_seq = np.vstack((self.joint_q_seq, joint_q_np[0:self.robot_joint_q_cnt]))
+            self.openness_seq = np.vstack((self.openness_seq, np.array([self.open_left_gripper, self.open_right_gripper])))
+
+            if self.sim_frame == 32 * self.fps:
+                np.savez('lift2_manipulating_cloth.npz', joint_q=self.joint_q_seq, openness=self.openness_seq)
+
 
     def test(self):
         pass
