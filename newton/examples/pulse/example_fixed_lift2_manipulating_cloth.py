@@ -692,10 +692,6 @@ class Example:
             self.joint_q_seq = np.vstack((self.joint_q_seq, joint_q_np[0:self.robot_joint_q_cnt]))
             self.openness_seq = np.vstack((self.openness_seq, np.array([self.open_left_gripper, self.open_right_gripper])))
 
-            if self.sim_frame == 32 * self.fps:
-                np.savez('lift2_manipulating_cloth.npz', joint_q=self.joint_q_seq, openness=self.openness_seq)
-
-
     def test(self):
         pass
 
@@ -725,3 +721,8 @@ if __name__ == "__main__":
     viewer, args = newton.examples.init()
     example = Example(viewer)
     newton.examples.run(example, args)
+
+    if example.use_dump_joint:
+        print("save manipultaingcloth")
+        np.savez('lift2_manipulating_cloth.npz', joint_q=example.joint_q_seq, openness=example.openness_seq)
+
