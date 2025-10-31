@@ -25,16 +25,16 @@
 
 import warp as wp
 import numpy as np
+from pxr import Usd, UsdGeom
 
 import newton
 import newton.examples
 import newton.ik as ik
 import newton.utils
 
-from warp.sim.utils import load_mesh
-from warp.sim.render import SimRendererUsd
-
 import io_util
+from trajectory_animation import KeyFrameTrajectoryAnimation
+import os
 
 def limit_joint_move(tar_q, cur_q, max_qd, dt):
     err = tar_q-cur_q
@@ -67,6 +67,7 @@ def transform_diff(tf1, tf2, pos_thres=1e-3, rot_thres=1e-3):
 def linear_map(theta, lo, hi):
     return lo + theta*(hi-lo)
 
+
 from enum import IntEnum
 
 class GripperControlType(IntEnum):
@@ -82,6 +83,17 @@ class GripperControlType(IntEnum):
 
     TARGET_VELOCITY = 2
     """Control the gripper finger by setting the target velocity."""
+
+class AnimationType(IntEnum):
+    """
+    Flags for robot animation controlling.
+    """
+
+    INTERACTIVE = 0
+    """Interactive control with gizmo."""
+
+    TRAJECTORY = 1
+    """Trajectory control."""
 
 # config the joint types
 fixed_joint_names = {
@@ -109,7 +121,7 @@ right_gripper_joint_names = {"fr_joint7", "fr_joint8",}
 class Example:
     def __init__(self, viewer):
         # frame timing
-        self.fps = 120
+        self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
         self.sim_frame = 0
@@ -120,11 +132,48 @@ class Example:
         # self.gripper_control_type = GripperControlType.TARGET_VELOCITY
 
         # TODO: 
-        self.use_mujoco_cpu = False
+        self.use_mujoco_cpu = True
         # self.use_mujoco_cpu = True  # Use MuJoCo-CPU (stable cube grasp)
         # self.use_mujoco_cpu = False # Use MuJoCo-Warp (friction still inaccurate)
 
+        self.animation_type = AnimationType.TRAJECTORY
+        # self.animation_type = AnimationType.INTERACTIVE
+
+        # dump visualization image sequence
         self.use_dump_image = False
+        # self.use_dump_image = True
+
+        # dump joint q into .npz
+        self.use_dump_joint = False
+
+        # VBD parameters
+        if self.animation_type == AnimationType.INTERACTIVE:
+            self.sim_vbd_iterations = 3    
+        if self.animation_type == AnimationType.TRAJECTORY:
+            self.sim_vbd_iterations = 7
+        # self.sim_vbd_iterations = 3
+        #       body-cloth contact
+        self.cloth_particle_radius = 0.008
+        self.cloth_body_contact_margin = 0.01
+        #       self-contact
+        self.self_contact_radius = 0.002
+        self.self_contact_margin = 0.003
+
+        self.soft_contact_ke = 300
+        self.soft_contact_kd = 5e-3
+
+        self.robot_friction = 1.5
+        self.table_friction = 0.25
+        self.self_contact_friction = 0.25
+
+        #   elasticity
+        self.tri_ke = 1e2
+        self.tri_ka = 1e2
+        self.tri_kd = 1.5e-6
+
+        self.bending_ke = 1e-4
+        self.bending_kd = 1e-3
+
 
         self.viewer = viewer
 
@@ -199,6 +248,10 @@ class Example:
         print("left joint", self.left_gripper_joint_indices)
         print("right joint", self.right_gripper_joint_indices)
 
+        if self.use_dump_joint:
+            self.joint_q_seq = np.empty((0, franka.joint_dof_count), dtype=np.float32)
+            self.openness_seq = np.empty((0, 2), dtype=np.float32)
+
         # ------------------------------------------------------------------
         # Configurate joints
         # ------------------------------------------------------------------
@@ -219,7 +272,7 @@ class Example:
         # Configure control for the gripper
         for i in np.concatenate((self.left_gripper_joint_indices, self.right_gripper_joint_indices)):
             # Leave a small gap to avoid penetration
-            franka.joint_limit_lower[i] = 0.001
+            franka.joint_limit_lower[i] = 0.005
             # franka.joint_limit_upper[i] = 0.04
 
             # Configure target control for gripper joints
@@ -234,67 +287,81 @@ class Example:
             if self.gripper_control_type == GripperControlType.TARGET_VELOCITY:
                 franka.joint_dof_mode[i] = newton.JointMode.TARGET_VELOCITY
                 franka.joint_target_kd[i] = 10.0
-
+        
         # ------------------------------------------------------------------
         # Add other objects
         # ------------------------------------------------------------------
 
-        # MESH (basket)
-        [mesh_vertices, mesh_indices] = load_mesh(newton.examples.get_asset("fruits/plate.obj"))
-        mesh_basket = newton.Mesh(mesh_vertices, mesh_indices)
-        body_mesh_basket = franka.add_body(xform=wp.transform(p=wp.vec3(0.65, 0, 0.55)))
-        franka.add_joint_free(body_mesh_basket)
-        franka.add_shape_mesh(body_mesh_basket, mesh = mesh_basket, cfg=newton.ModelBuilder.ShapeConfig(density=710.0))
-
-        # franka.approximate_meshes("coacd")
-
         # Add a fixed table
-        pos = wp.vec3(0.7, 0.0, 0.201)
+        pos = wp.vec3(1.0, 0.0, 0.201)
         rot = wp.quat_identity()
         body_table = franka.add_body()
         franka.add_joint_fixed(-1, body_table)
-        franka.add_shape_box(body_table, xform=wp.transform(p=pos, q=rot), hx=0.4, hy=0.8, hz=0.15)
+        franka.add_shape_box(body_table, xform=wp.transform(p=pos, q=rot), hx=0.6, hy=0.6, hz=0.2)
+        # franka.add_shape_cylinder(body_table, xform=wp.transform(p=pos, q=rot), radius=0.4, half_height=0.2)
 
-        # MESH (carrot)
-        [mesh_vertices, mesh_indices] = load_mesh(newton.examples.get_asset("fruits/SM_CarrotA_Carrot_0/SM_CarrotA_Carrot_0.obj"))
-        mesh_carrot = newton.Mesh(mesh_vertices, mesh_indices)
-        body_mesh_carrot = franka.add_body(xform=wp.transform(p=wp.vec3(0.55, 0.45, 0.55)))
-        franka.add_joint_free(body_mesh_carrot)
-        franka.add_shape_mesh(body_mesh_carrot, mesh = mesh_carrot, cfg=newton.ModelBuilder.ShapeConfig(density=710.0))
+        # Add a box
+        pos = wp.vec3(0.6, 0.0, 0.43)
+        rot = wp.quat_identity()
+        body_box = franka.add_body(xform=wp.transform(p=pos, q=rot))
+        franka.add_joint_free(body_box)
+        franka.add_shape_box(body_box, hx=0.03, hy=0.03, hz=0.03, cfg=newton.ModelBuilder.ShapeConfig(density=100.0))
 
-        # MESH (bellpepper)
-        [mesh_vertices, mesh_indices] = load_mesh(newton.examples.get_asset("fruits/SM_KingOysterMushroom_KingOysterMushroom_0/SM_KingOysterMushroom_KingOysterMushroom_0.obj"))
-        mesh_bellpepper = newton.Mesh(mesh_vertices, mesh_indices)
-        body_mesh_bellpepper = franka.add_body(xform=wp.transform(p=wp.vec3(0.6, 0.3, 0.45)))
-        franka.add_joint_free(body_mesh_bellpepper)
-        franka.add_shape_mesh(body_mesh_bellpepper, mesh = mesh_bellpepper, cfg=newton.ModelBuilder.ShapeConfig(density=710.0))
-
-        # MESH (broccoli)
-        [mesh_vertices, mesh_indices] = load_mesh(newton.examples.get_asset("fruits/SM_Eggplant_Eggplant_0/SM_Eggplant_Eggplant_0.obj"))
-        mesh_broccoli = newton.Mesh(mesh_vertices, mesh_indices)
-        body_mesh_broccoli = franka.add_body(xform=wp.transform(p=wp.vec3(0.65, -0.3, 0.45)))
-        franka.add_joint_free(body_mesh_broccoli)
-        franka.add_shape_mesh(body_mesh_broccoli, mesh = mesh_broccoli, cfg=newton.ModelBuilder.ShapeConfig(density=710.0))
-
-        # # Add a box
-        # pos = wp.vec3(0.6, 0.0, 0.43)
-        # rot = wp.quat_identity()
-        # body_box = franka.add_body(xform=wp.transform(p=pos, q=rot))
-        # franka.add_joint_free(body_box)
-        # franka.add_shape_box(body_box, hx=0.03, hy=0.03, hz=0.03, cfg=newton.ModelBuilder.ShapeConfig(density=100.0))
-
-        # # Set friction
+        # Set friction
         for i in range(len(franka.shape_material_mu)):
             franka.shape_material_mu[i] = 1.0
-            franka.shape_material_kd[i] = 1.0e8
+            franka.shape_material_ka[i] = 0.002
+            franka.shape_is_solid[i] = True
+
+        # Add the T-shirt
+        # garment can be downloaded from https://gitee.pjlab.org.cn/L2/wanghui1/PulseAsset.git
+        usd_stage = Usd.Stage.Open(newton.examples.get_asset("PulseAsset/cloth/garment-tri.usdc"))
+        usd_geom = UsdGeom.Mesh(usd_stage.GetPrimAtPath("/root/World/mesh/Mesh"))
+        # for prim in usd_stage.Traverse():
+        #     print(prim.GetPath())
+        #     if prim.IsA(UsdGeom.Mesh):
+        #         print("Mesh:", prim.GetPath())
+        #     elif prim.IsA(UsdGeom.Points):
+        #         print("Points:", prim.GetPath())
+        #     elif prim.IsA(UsdGeom.Curves):
+        #         print("Curves:", prim.GetPath())
+        
+        mesh_points = np.array(usd_geom.GetPointsAttr().Get())
+        mesh_indices = np.array(usd_geom.GetFaceVertexIndicesAttr().Get())
+        print("=== Cloth Information ===")
+        print(f"vertices = {mesh_points.shape}, faces = {mesh_indices.shape}")
+
+        vertices = [wp.vec3(v) for v in mesh_points]
+        franka.add_cloth_mesh(
+            vertices=vertices,
+            indices=mesh_indices,
+            rot=wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), np.pi*0.5),
+            pos=wp.vec3(0.7, 0.00, 0.5),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            density=0.2,
+            scale=0.01,
+            tri_ke=self.tri_ke,
+            tri_ka=self.tri_ka,
+            tri_kd=self.tri_kd,
+            edge_ke=self.bending_ke,
+            edge_kd=self.bending_kd,
+            particle_radius=self.cloth_particle_radius,
+        )
+
+        franka.color()
+
 
         # ------------------------------------------------------------------
         # Finalization and initialization of computational components
         # ------------------------------------------------------------------
 
         # Finalize builder
-        self.model = franka.finalize()
-        self.model.ground = True
+        self.model = franka.finalize(requires_grad=False)
+
+        # Set cloth parameter
+        self.model.soft_contact_ke = self.soft_contact_ke
+        self.model.soft_contact_kd = self.soft_contact_kd
+        self.model.soft_contact_mu = self.self_contact_friction
 
         # Warp compute graphs
         self.ik_graph = None
@@ -389,6 +456,11 @@ class Example:
         self.ik_joint_qd = wp.array(self.model.joint_qd, shape=(self.model.joint_dof_count))
         self.ik_iters = 24
 
+        # trajectory animation
+        # TODO: better API
+        self.trajectory_animation = KeyFrameTrajectoryAnimation()
+        self.trajectory_animation.init_lift2_folding()
+
         # ------------------------------------------------------------------
         # Solvers
         # ------------------------------------------------------------------
@@ -405,20 +477,32 @@ class Example:
         # Rigid body solver
         self.rigid_solver = newton.solvers.SolverMuJoCo(
             self.model,
-            njmax=50000, # large enough to avoid nefc overflow
-            ncon_per_env=50000, # large enough to avoid illegal mem access
+            njmax=150000, # large enough to avoid nefc overflow
+            ncon_per_world=150000, # large enough to avoid illegal mem access
             solver='newton',
             cone="elliptic",
+            # disable_contacts=True, 
             use_mujoco_cpu=self.use_mujoco_cpu, # mujoco-cpu or mujoco-warp
             # use_mujoco_contacts=True, # incorrect collision when using mujoco-warp
-            # use_mujoco_contacts=False, # incorrect friction when using mujoco-warp
+            use_mujoco_contacts=False, # incorrect friction when using mujoco-warp
             contact_stiffness_time_const=self.sim_dt # important param to ensure zero penetration
         )
 
-        self.capture()
+        # Cloth solver
+        self.model.edge_rest_angle.zero_()
+        self.cloth_solver = newton.solvers.SolverVBDPulse(
+            self.model,
+            iterations=self.sim_vbd_iterations,
+            self_contact_radius=self.self_contact_radius,
+            self_contact_margin=self.self_contact_margin,
+            handle_self_contact=True,
+            vertex_collision_buffer_pre_alloc=32,
+            edge_collision_buffer_pre_alloc=64,
+            integrate_with_external_rigid_solver=True,
+            collision_detection_interval=-1,
+        )
 
-        # self.usd_viewer = newton.viewer.ViewerUSD(output_path="fruits.usd")
-        # self.usd_viewer.set_model(self.model)
+        self.capture()
 
     # ----------------------------------------------------------------------
     # Helpers
@@ -449,7 +533,20 @@ class Example:
             # set control in supsteps
             # self.update_control()
 
+            # Clear particle info for rigid_solver
+            particle_count = self.model.particle_count
+            self.model.particle_count = 0
+
             self.rigid_solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+
+
+            # Recover the particle info
+            self.state_0.particle_f.zero_()
+            self.model.particle_count = particle_count
+
+            # Solve the cloth, add force onto state_1
+            self.contacts = self.model.collide(self.state_0, soft_contact_margin=self.cloth_body_contact_margin)
+            self.cloth_solver.step(self.state_0, self.state_1, None, self.contacts, self.sim_dt)
 
             # swap state
             (self.state_0, self.state_1) = (self.state_1, self.state_0)
@@ -464,12 +561,6 @@ class Example:
         q = wp.transform_get_rotation(self.ree_tf)
         self.r_rot_obj.set_target_rotation(0, wp.vec4(q[0], q[1], q[2], q[3]))
 
-    # ----------------------------------------------------------------------
-    # Template API
-    # ----------------------------------------------------------------------
-    def step(self):
-        self._push_targets_from_gizmos()
-
         if hasattr(self.viewer, "is_key_down"):
             if self.viewer.is_key_down("1"):
                 self.open_left_gripper = 0
@@ -480,6 +571,50 @@ class Example:
                 self.open_right_gripper = 0
             else:
                 self.open_right_gripper = 1
+
+        print(f"Left  end effector:{self.lee_tf}")
+        print(f"Right end effector:{self.ree_tf}")
+
+        # self.cloth_solver.finger_indices.assign([self.open_left_gripper, self.open_left_gripper, self.open_right_gripper, self.open_right_gripper])
+
+        # self.cloth_solver.finger_states.assign([self.open_left_gripper, self.open_left_gripper, self.open_right_gripper, self.open_right_gripper])
+
+        # print(self.cloth_solver.finger_states)
+
+    def _push_targets_from_trajectories(self):
+        """Read transform from trajectory and push into IK objectives."""
+        
+        transform, state = self.trajectory_animation.get_pose("left_gripper", self.sim_time)
+        transform = wp.transform(*transform)
+        self.l_pos_obj.set_target_position(0, wp.transform_get_translation(transform))
+        q = wp.transform_get_rotation(transform)
+        self.l_rot_obj.set_target_rotation(0, wp.vec4(q[0], q[1], q[2], q[3]))
+        self.open_left_gripper = state
+
+        transform, state = self.trajectory_animation.get_pose("right_gripper", self.sim_time)
+        transform = wp.transform(*transform)
+        self.r_pos_obj.set_target_position(0, wp.transform_get_translation(transform))
+        q = wp.transform_get_rotation(transform)
+        self.r_rot_obj.set_target_rotation(0, wp.vec4(q[0], q[1], q[2], q[3]))
+        self.open_right_gripper = state
+
+
+        # self.cloth_solver.finger_states.assign([self.open_right_gripper, self.open_right_gripper, self.open_left_gripper, self.open_left_gripper])
+
+        # print(self.cloth_solver.finger_states, self.cloth_solver.finger_indices)
+
+    # ----------------------------------------------------------------------
+    # Template API
+    # ----------------------------------------------------------------------
+    def step(self):
+        print('step time', self.sim_time)
+
+        if self.animation_type == AnimationType.INTERACTIVE:
+            self._push_targets_from_gizmos()
+
+        if self.animation_type == AnimationType.TRAJECTORY:
+            self._push_targets_from_trajectories()
+
 
         # IK step, update self.ik_joint_q as the target pose
         if self.ik_graph:
@@ -531,20 +666,6 @@ class Example:
         self.ik_joint_qd.assign(joint_qd_np)
         self.state_0.joint_qd.assign(joint_qd_np)
 
-        # Set joint velocity for the grippers
-        gripper_vel = 0.2
-
-        # Velocity control for [gripper]
-        if self.gripper_control_type == GripperControlType.TARGET_VELOCITY:
-            joint_target_np = self.control.joint_target.numpy()
-
-            vel = linear_map(self.open_left_gripper, -gripper_vel, gripper_vel)
-            joint_target_np[self.left_gripper_joint_indices] = vel
-            vel = linear_map(self.open_right_gripper, -gripper_vel, gripper_vel)
-            joint_target_np[self.right_gripper_joint_indices] = vel
-            self.control.joint_target.assign(joint_target_np)
-
-
         # Physics step
         if self.physics_graph:
             wp.capture_launch(self.physics_graph)
@@ -553,6 +674,15 @@ class Example:
 
         self.sim_time += self.frame_dt
         self.sim_frame += 1
+        
+        if self.use_dump_joint:
+            joint_q_np = self.state_0.joint_q.numpy()
+            self.joint_q_seq = np.vstack((self.joint_q_seq, joint_q_np[0:self.robot_joint_q_cnt]))
+            self.openness_seq = np.vstack((self.openness_seq, np.array([self.open_left_gripper, self.open_right_gripper])))
+
+            if self.sim_frame == 32 * self.fps:
+                np.savez('lift2_manipulating_cloth.npz', joint_q=self.joint_q_seq, openness=self.openness_seq)
+
 
     def test(self):
         pass
@@ -560,9 +690,10 @@ class Example:
     def render(self):
         self.viewer.begin_frame(self.sim_time)
 
-        # Register gizmo (viewer will draw & mutate transform in-place)
-        self.viewer.log_gizmo("left_target_tcp", self.lee_tf)
-        self.viewer.log_gizmo("right_target_tcp", self.ree_tf)
+        if self.animation_type == AnimationType.INTERACTIVE:
+            # Register gizmo (viewer will draw & mutate transform in-place)
+            self.viewer.log_gizmo("left_target_tcp", self.lee_tf)
+            self.viewer.log_gizmo("right_target_tcp", self.ree_tf)
         # self.viewer.log_state(self.state)
         self.viewer.log_state(self.state_0)
 
@@ -570,12 +701,15 @@ class Example:
         self.viewer.end_frame()
 
         wp.synchronize()
+
         if self.use_dump_image:
             io_util.dump_gl_frame_image(self.viewer.renderer._screen_width,self.viewer.renderer._screen_height,f"img_{self.sim_frame}.png")
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
-    # parser.set_defaults(viewer="usd", output_path="lift2_interactive_control.usd")
+    if not os.environ.get("DISPLAY"):
+        parser.set_defaults(viewer="null", headless=True)
+
     viewer, args = newton.examples.init(parser)
     example = Example(viewer)
     newton.examples.run(example, args)

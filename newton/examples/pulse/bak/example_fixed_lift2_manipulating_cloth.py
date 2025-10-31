@@ -34,7 +34,63 @@ import newton.utils
 
 import io_util
 from trajectory_animation import KeyFrameTrajectoryAnimation
+import os
 
+# ---------------------------------------------
+# Warp kernels for substep joint interpolation
+# ---------------------------------------------
+
+@wp.kernel
+def interpolate_joint_q_kernel(
+    start_q: wp.array(dtype=float),
+    target_q: wp.array(dtype=float),
+    substep_q: wp.array(dtype=float),
+    joint_count: int,
+    substeps: int,
+):
+    tid = wp.tid()
+    total = joint_count * substeps
+    if tid >= total:
+        return
+
+    s = tid // joint_count
+    j = tid - s * joint_count
+
+    f = float(s + 1) / float(substeps)
+    val = start_q[j] + f * (target_q[j] - start_q[j])
+    substep_q[tid] = val
+
+
+@wp.kernel
+def write_substep_control_kernel(
+    substep_q: wp.array(dtype=float),            # length: substeps * joint_coord_count
+    frame_target_q: wp.array(dtype=float),       # length: joint_coord_count
+    control_joint_target: wp.array(dtype=float), # length: joint_dof_count
+    gripper_vel: wp.array(dtype=float),          # length: joint_dof_count
+    pos_mask: wp.array(dtype=int),               # DOF-level mask: position-controlled DOFs
+    vel_mask: wp.array(dtype=int),               # DOF-level mask: velocity-controlled DOFs
+    interp_pos_mask_dof: wp.array(dtype=int),    # DOF-level mask: DOFs to interpolate (grippers only)
+    joint_dof_count: int,
+    joint_coord_count: int,
+    substeps: int,
+    s: int,
+):
+    j = wp.tid()
+    if j >= joint_dof_count:
+        return
+
+    if vel_mask[j] != 0:
+        control_joint_target[j] = gripper_vel[j]
+        return
+
+    if pos_mask[j] != 0:
+        if interp_pos_mask_dof[j] != 0:
+            control_joint_target[j] = substep_q[s * joint_coord_count + j]
+        else:
+            control_joint_target[j] = frame_target_q[j]
+        return
+
+    # leave unchanged for joints without control
 
 def limit_joint_move(tar_q, cur_q, max_qd, dt):
     err = tar_q-cur_q
@@ -125,14 +181,14 @@ class Example:
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
         self.sim_frame = 0
-        self.sim_substeps = 10
+        self.sim_substeps = 20
         self.sim_dt = self.frame_dt / self.sim_substeps
 
-        # self.gripper_control_type = GripperControlType.TARGET_POSITION
-        self.gripper_control_type = GripperControlType.TARGET_VELOCITY
+        self.gripper_control_type = GripperControlType.TARGET_POSITION
+        # self.gripper_control_type = GripperControlType.TARGET_VELOCITY
 
         # TODO: 
-        self.use_mujoco_cpu = True
+        self.use_mujoco_cpu = False
         # self.use_mujoco_cpu = True  # Use MuJoCo-CPU (stable cube grasp)
         # self.use_mujoco_cpu = False # Use MuJoCo-Warp (friction still inaccurate)
 
@@ -176,6 +232,7 @@ class Example:
 
 
         self.viewer = viewer
+        self.debug_substeps = True
 
         # ------------------------------------------------------------------
         # Build a single ARX Lift (fixed base) + ground
@@ -315,7 +372,7 @@ class Example:
 
         # Add the T-shirt
         # garment can be downloaded from https://gitee.pjlab.org.cn/L2/wanghui1/PulseAsset.git
-        usd_stage = Usd.Stage.Open(newton.examples.get_asset("garment-tri.usdc"))
+        usd_stage = Usd.Stage.Open(newton.examples.get_asset("PulseAsset/cloth/garment-tri.usdc"))
         usd_geom = UsdGeom.Mesh(usd_stage.GetPrimAtPath("/root/World/mesh/Mesh"))
         # for prim in usd_stage.Traverse():
         #     print(prim.GetPath())
@@ -382,11 +439,47 @@ class Example:
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state)
         self.control = self.model.control() # for control
 
+        # ---------------------------------------------
+        # Buffers and masks for substep control
+        # ---------------------------------------------
+        self.joint_coord_count = int(self.model.joint_coord_count)
+        self.joint_dof_count = int(self.model.joint_dof_count)
+
+        # substep joint positions (flattened: substeps * joint_coord_count)
+        self.substep_joint_q = wp.zeros(self.sim_substeps * self.joint_coord_count, dtype=float)
+        # per-frame target joint positions (length = joint_coord_count)
+        self.frame_target_q = wp.zeros(self.joint_coord_count, dtype=float)
+
+        # control masks
+        pos_mask_np = np.zeros(self.joint_dof_count, dtype=np.int32)
+        vel_mask_np = np.zeros(self.joint_dof_count, dtype=np.int32)
+        # controllable arm joints always in position-target mode
+        pos_mask_np[self.controllable_joint_indices] = 1
+        # gripper control depends on mode
+        if self.gripper_control_type == GripperControlType.TARGET_POSITION:
+            pos_mask_np[self.left_gripper_joint_indices] = 1
+            pos_mask_np[self.right_gripper_joint_indices] = 1
+        elif self.gripper_control_type == GripperControlType.TARGET_VELOCITY:
+            vel_mask_np[self.left_gripper_joint_indices] = 1
+            vel_mask_np[self.right_gripper_joint_indices] = 1
+
+        self.pos_mask = wp.array(pos_mask_np, dtype=int)
+        self.vel_mask = wp.array(vel_mask_np, dtype=int)
+        # per-frame gripper velocity targets (length = joint_dof_count)
+        self.gripper_vel = wp.zeros(self.joint_dof_count, dtype=float)
+
+        # which DOFs to interpolate across substeps (grippers only)
+        interp_pos_mask_np = np.zeros(self.joint_dof_count, dtype=np.int32)
+        if self.gripper_control_type == GripperControlType.TARGET_POSITION:
+            interp_pos_mask_np[self.left_gripper_joint_indices] = 1
+            interp_pos_mask_np[self.right_gripper_joint_indices] = 1
+        self.interp_pos_mask_dof = wp.array(interp_pos_mask_np, dtype=int)
+
         # ------------------------------------------------------------------
         # End effector
         # ------------------------------------------------------------------
-        self.open_left_gripper = 1
-        self.open_right_gripper = 1
+        self.open_left_gripper = 1.0
+        self.open_right_gripper = 1.0
 
         # Persistent gizmo transform (pass-by-ref mutated by viewer)
         body_q_np = self.state.body_q.numpy()
@@ -477,8 +570,8 @@ class Example:
         # Rigid body solver
         self.rigid_solver = newton.solvers.SolverMuJoCo(
             self.model,
-            njmax=50000, # large enough to avoid nefc overflow
-            ncon_per_env=50000, # large enough to avoid illegal mem access
+            njmax=150000, # large enough to avoid nefc overflow
+            ncon_per_world=150000, # large enough to avoid illegal mem access
             solver='newton',
             cone="elliptic",
             # disable_contacts=True, 
@@ -515,7 +608,8 @@ class Example:
             self.ik_graph = capture.graph
 
         self.physics_graph = None
-        if wp.get_device().is_cuda and not self.use_mujoco_cpu:
+        # Skip CUDA graph capture when debugging substeps to avoid host copies during capture
+        if wp.get_device().is_cuda and not self.use_mujoco_cpu and not self.debug_substeps:
             with wp.ScopedCapture() as capture:
                 self.physics_simulate()
             self.physics_graph = capture.graph
@@ -524,14 +618,50 @@ class Example:
         self.solver.solve(iterations=self.ik_iters)
 
     def physics_simulate(self):
-        for _ in range(self.sim_substeps):
+        for s in range(self.sim_substeps):
+            # assign per-substep joint targets to control
+            wp.launch(
+                write_substep_control_kernel,
+                dim=self.joint_dof_count,
+                inputs=[
+                    self.substep_joint_q,
+                    self.frame_target_q,
+                    self.control.joint_target,
+                    self.gripper_vel,
+                    self.pos_mask,
+                    self.vel_mask,
+                    self.interp_pos_mask_dof,
+                    self.joint_dof_count,
+                    self.joint_coord_count,
+                    self.sim_substeps,
+                    s,
+                ],
+            )
+            if self.debug_substeps:
+                # Debug: print control targets and expected substep positions for grippers
+                ct_np = self.control.joint_target.numpy()
+                ft_np = self.frame_target_q.numpy()
+                ss_np = self.substep_joint_q.numpy()
+                q_before_np = self.state_0.joint_q.numpy()
+
+                ss_slice = ss_np[s*self.joint_coord_count:(s+1)*self.joint_coord_count]
+
+                left_ct = ct_np[self.left_gripper_joint_indices]
+                right_ct = ct_np[self.right_gripper_joint_indices]
+                left_ft = ft_np[self.left_gripper_joint_indices]
+                right_ft = ft_np[self.right_gripper_joint_indices]
+                left_ss = ss_slice[self.left_gripper_joint_indices]
+                right_ss = ss_slice[self.right_gripper_joint_indices]
+                left_q0 = q_before_np[self.left_gripper_joint_indices]
+                right_q0 = q_before_np[self.right_gripper_joint_indices]
+
+                print(f"[substep {s}] targets L:{left_ct} R:{right_ct}  frame L:{left_ft} R:{right_ft}  substep L:{left_ss} R:{right_ss}  q_before L:{left_q0} R:{right_q0}")
             self.contacts = self.model.collide(self.state_0)
 
             self.state_0.clear_forces()
             self.state_1.clear_forces()
 
-            # set control in supsteps
-            # self.update_control()
+            # control assigned above per substep
 
             # Clear particle info for rigid_solver
             particle_count = self.model.particle_count
@@ -550,6 +680,11 @@ class Example:
 
             # swap state
             (self.state_0, self.state_1) = (self.state_1, self.state_0)
+            if self.debug_substeps:
+                q_after_np = self.state_0.joint_q.numpy()
+                left_q1 = q_after_np[self.left_gripper_joint_indices]
+                right_q1 = q_after_np[self.right_gripper_joint_indices]
+                print(f"[substep {s}] q_after  L:{left_q1} R:{right_q1}")
 
     def _push_targets_from_gizmos(self):
         """Read gizmo-updated transform and push into IK objectives."""
@@ -563,14 +698,14 @@ class Example:
 
         if hasattr(self.viewer, "is_key_down"):
             if self.viewer.is_key_down("1"):
-                self.open_left_gripper = 0
+                self.open_left_gripper = 0.0
             else:
-                self.open_left_gripper = 1
+                self.open_left_gripper = 1.0
 
             if self.viewer.is_key_down("2"):
-                self.open_right_gripper = 0
+                self.open_right_gripper = 0.0
             else:
-                self.open_right_gripper = 1
+                self.open_right_gripper = 1.0
 
         print(f"Left  end effector:{self.lee_tf}")
         print(f"Right end effector:{self.ree_tf}")
@@ -607,6 +742,7 @@ class Example:
     # Template API
     # ----------------------------------------------------------------------
     def step(self):
+        print('step time', self.sim_time)
 
         if self.animation_type == AnimationType.INTERACTIVE:
             self._push_targets_from_gizmos()
@@ -629,54 +765,59 @@ class Example:
         joint_limit_lower_np = self.model.joint_limit_lower.numpy()
         joint_limit_upper_np = self.model.joint_limit_upper.numpy()
         if self.gripper_control_type == GripperControlType.TARGET_POSITION:
-            if self.open_left_gripper:
-                ik_joint_q_np[self.left_gripper_joint_indices] = joint_limit_upper_np[self.left_gripper_joint_indices]
-            else:
-                ik_joint_q_np[self.left_gripper_joint_indices] = joint_limit_lower_np[self.left_gripper_joint_indices]
+            # openness in [0,1] maps linearly to [lower, upper]
+            left_lower = joint_limit_lower_np[self.left_gripper_joint_indices]
+            left_upper = joint_limit_upper_np[self.left_gripper_joint_indices]
+            right_lower = joint_limit_lower_np[self.right_gripper_joint_indices]
+            right_upper = joint_limit_upper_np[self.right_gripper_joint_indices]
 
-            if self.open_right_gripper:
-                ik_joint_q_np[self.right_gripper_joint_indices] = joint_limit_upper_np[self.right_gripper_joint_indices]
-            else:
-                ik_joint_q_np[self.right_gripper_joint_indices] = joint_limit_lower_np[self.right_gripper_joint_indices]
+            left_pos = left_lower + self.open_left_gripper * (left_upper - left_lower)
+            right_pos = right_lower + self.open_right_gripper * (right_upper - right_lower)
 
+            ik_joint_q_np[self.left_gripper_joint_indices] = left_pos
+            ik_joint_q_np[self.right_gripper_joint_indices] = right_pos
         ik_joint_q.assign(ik_joint_q_np)
 
         # Align the self.state with the target body in the viewer
-        newton.eval_fk(self.model, ik_joint_q, self.model.joint_qd, self.state)
+        # newton.eval_fk(self.model, ik_joint_q, self.model.joint_qd, self.state)
         
         # Limit the joint movement in one frame
         move, target = limit_joint_move(ik_joint_q.numpy(), self.state_0.joint_q.numpy(), 20.0, self.frame_dt)
 
-        # Set target q control for [controllable joint] and [gripper]
-        joint_target_np = self.control.joint_target.numpy()
-        joint_target_np[self.controllable_joint_indices] = target.flatten()[self.controllable_joint_indices]
-        if self.gripper_control_type == GripperControlType.TARGET_POSITION:
-            joint_target_np[self.left_gripper_joint_indices]=(target.flatten()[self.left_gripper_joint_indices])
-            joint_target_np[self.right_gripper_joint_indices]=(target.flatten()[self.right_gripper_joint_indices])
-        self.control.joint_target.assign(joint_target_np)
+        # Prepare per-frame targets for substep interpolation (GPU)
+        self.frame_target_q.assign(target.flatten())
 
         # Set joint qd for [controllable joint] and [gripper]
         joint_qd_np = self.state_0.joint_qd.numpy()
         ik_joint_qd_np = move/self.frame_dt
         joint_qd_np[self.controllable_joint_indices] = ik_joint_qd_np[self.controllable_joint_indices]
-        if self.gripper_control_type == GripperControlType.TARGET_POSITION:
-            joint_qd_np[self.left_gripper_joint_indices]=(ik_joint_qd_np[self.left_gripper_joint_indices])
-            joint_qd_np[self.right_gripper_joint_indices]=(ik_joint_qd_np[self.right_gripper_joint_indices])
         self.ik_joint_qd.assign(joint_qd_np)
         self.state_0.joint_qd.assign(joint_qd_np)
 
         # Set joint velocity for the grippers
         gripper_vel = 0.2
 
-        # Velocity control for [gripper]
+        # Velocity control for [gripper] (per-frame, replicated across substeps on GPU)
         if self.gripper_control_type == GripperControlType.TARGET_VELOCITY:
-            joint_target_np = self.control.joint_target.numpy()
-
+            gv_np = np.zeros(self.joint_dof_count, dtype=np.float32)
             vel = linear_map(self.open_left_gripper, -gripper_vel, gripper_vel)
-            joint_target_np[self.left_gripper_joint_indices] = vel
+            gv_np[self.left_gripper_joint_indices] = vel
             vel = linear_map(self.open_right_gripper, -gripper_vel, gripper_vel)
-            joint_target_np[self.right_gripper_joint_indices] = vel
-            self.control.joint_target.assign(joint_target_np)
+            gv_np[self.right_gripper_joint_indices] = vel
+            self.gripper_vel.assign(gv_np)
+
+        # Precompute substep joint targets on GPU
+        wp.launch(
+            interpolate_joint_q_kernel,
+            dim=self.sim_substeps * self.joint_coord_count,
+            inputs=[
+                self.state_0.joint_q,
+                self.frame_target_q,
+                self.substep_joint_q,
+                self.joint_coord_count,
+                self.sim_substeps,
+            ],
+        )
 
         # Physics step
         if self.physics_graph:
@@ -718,10 +859,10 @@ class Example:
             io_util.dump_gl_frame_image(self.viewer.renderer._screen_width,self.viewer.renderer._screen_height,f"img_{self.sim_frame}.png")
 
 if __name__ == "__main__":
-    # parser = newton.examples.create_parser()
-    # parser.set_defaults(num_frames=50, viewer="usd", output_path="cloth_bending.usd")
-    # viewer, args = newton.examples.init(parser)
+    parser = newton.examples.create_parser()
+    if not os.environ.get("DISPLAY"):
+        parser.set_defaults(viewer="null", headless=True)
 
-    viewer, args = newton.examples.init()
+    viewer, args = newton.examples.init(parser)
     example = Example(viewer)
     newton.examples.run(example, args)

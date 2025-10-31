@@ -23,8 +23,6 @@
 # Command: python -m newton.examples ik_franka
 ###########################################################################
 
-import os
-
 import warp as wp
 import numpy as np
 from pxr import Usd, UsdGeom
@@ -36,7 +34,7 @@ import newton.utils
 
 import io_util
 from trajectory_animation import KeyFrameTrajectoryAnimation
-
+import os
 
 def limit_joint_move(tar_q, cur_q, max_qd, dt):
     err = tar_q-cur_q
@@ -127,11 +125,11 @@ class Example:
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
         self.sim_frame = 0
-        self.sim_substeps = 20
+        self.sim_substeps = 10
         self.sim_dt = self.frame_dt / self.sim_substeps
 
-        # self.gripper_control_type = GripperControlType.TARGET_POSITION # !
-        self.gripper_control_type = GripperControlType.TARGET_VELOCITY 
+        self.gripper_control_type = GripperControlType.TARGET_POSITION
+        # self.gripper_control_type = GripperControlType.TARGET_VELOCITY
 
         # TODO: 
         self.use_mujoco_cpu = True
@@ -315,7 +313,7 @@ class Example:
             franka.shape_material_ka[i] = 0.002
             franka.shape_is_solid[i] = True
 
-        # Add the T-shirt 
+        # Add the T-shirt
         # garment can be downloaded from https://gitee.pjlab.org.cn/L2/wanghui1/PulseAsset.git
         usd_stage = Usd.Stage.Open(newton.examples.get_asset("PulseAsset/cloth/garment-tri.usdc"))
         usd_geom = UsdGeom.Mesh(usd_stage.GetPrimAtPath("/root/World/mesh/Mesh"))
@@ -387,8 +385,10 @@ class Example:
         # ------------------------------------------------------------------
         # End effector
         # ------------------------------------------------------------------
-        self.open_left_gripper = 1
-        self.open_right_gripper = 1
+        self.open_left_gripper = 1.0
+        self.open_right_gripper = 1.0
+        self.left_gripper_state = 1.0
+        self.right_gripper_state = 1.0
 
         # Persistent gizmo transform (pass-by-ref mutated by viewer)
         body_q_np = self.state.body_q.numpy()
@@ -479,14 +479,14 @@ class Example:
         # Rigid body solver
         self.rigid_solver = newton.solvers.SolverMuJoCo(
             self.model,
-            njmax=50000, # large enough to avoid nefc overflow
-            ncon_per_env=50000, # large enough to avoid illegal mem access
+            njmax=150000, # large enough to avoid nefc overflow
+            ncon_per_world=150000, # large enough to avoid illegal mem access
             solver='newton',
             cone="elliptic",
             # disable_contacts=True, 
             use_mujoco_cpu=self.use_mujoco_cpu, # mujoco-cpu or mujoco-warp
-            # use_mujoco_contacts=True, # incorrect collision when using mujoco-warp
-            use_mujoco_contacts=False, # incorrect friction when using mujoco-warp
+            use_mujoco_contacts=True, # incorrect collision when using mujoco-warp
+            # use_mujoco_contacts=False, # incorrect friction when using mujoco-warp
             contact_stiffness_time_const=self.sim_dt # important param to ensure zero penetration
         )
 
@@ -526,7 +526,7 @@ class Example:
         self.solver.solve(iterations=self.ik_iters)
 
     def physics_simulate(self):
-        # for i in range(self.sim_substeps):
+        # for _ in range(self.sim_substeps):
         self.contacts = self.model.collide(self.state_0)
 
         self.state_0.clear_forces()
@@ -538,8 +538,7 @@ class Example:
         # Clear particle info for rigid_solver
         particle_count = self.model.particle_count
         self.model.particle_count = 0
-        # control i , state_0_i assign 
-        # self.update_control()
+
         self.rigid_solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
 
 
@@ -566,14 +565,14 @@ class Example:
 
         if hasattr(self.viewer, "is_key_down"):
             if self.viewer.is_key_down("1"):
-                self.open_left_gripper = 0
+                self.open_left_gripper = 0.0
             else:
-                self.open_left_gripper = 1
+                self.open_left_gripper = 1.0
 
             if self.viewer.is_key_down("2"):
-                self.open_right_gripper = 0
+                self.open_right_gripper = 0.0
             else:
-                self.open_right_gripper = 1
+                self.open_right_gripper = 1.0
 
         print(f"Left  end effector:{self.lee_tf}")
         print(f"Right end effector:{self.ree_tf}")
@@ -586,6 +585,7 @@ class Example:
 
     def _push_targets_from_trajectories(self):
         """Read transform from trajectory and push into IK objectives."""
+        
         transform, state = self.trajectory_animation.get_pose("left_gripper", self.sim_time)
         transform = wp.transform(*transform)
         self.l_pos_obj.set_target_position(0, wp.transform_get_translation(transform))
@@ -594,8 +594,8 @@ class Example:
         self.open_left_gripper = state
 
         transform, state = self.trajectory_animation.get_pose("right_gripper", self.sim_time)
-        transform = wp.transform(*transform) # x,y,z + quaternion
-        self.r_pos_obj.set_target_position(0, wp.transform_get_translation(transform)) 
+        transform = wp.transform(*transform)
+        self.r_pos_obj.set_target_position(0, wp.transform_get_translation(transform))
         q = wp.transform_get_rotation(transform)
         self.r_rot_obj.set_target_rotation(0, wp.vec4(q[0], q[1], q[2], q[3]))
         self.open_right_gripper = state
@@ -605,142 +605,77 @@ class Example:
 
         # print(self.cloth_solver.finger_states, self.cloth_solver.finger_indices)
 
-    def get_curr_gripper_transform_and_state(self):
-        # Ensure state_0 has up-to-date body transforms before we read them.
-        # Previously, FK was never run for state_0 before the first frame, so body_q defaulted to identity transforms.
-        # That caused interpolation to assume an origin of (0,0,0) instead of the true current EE pose (~0.26,0.24,0.55),
-        # making the first waypoint exactly ~1/10 of the target while the physics result stayed near the true pose
-        # (leading to the apparent 10x discrepancy). Running eval_fk here fixes the baseline.
-        # newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
-        body_q_np = self.state_0.body_q.numpy()
-        self.curr_transform_left = wp.transform(*body_q_np[self.lee_index])
-        self.curr_left_state = float(self.open_left_gripper) + 1e-7
-        # print('time', self.sim_time, ' current transform left:', self.curr_transform_left, 'left state', self.curr_left_state)
-
-        self.curr_transform_right = wp.transform(*body_q_np[self.ree_index])
-        self.curr_right_state = self.open_right_gripper
-        # print('time', self.sim_time, ' current transform right:', self.curr_transform_right, 'right state', self.curr_right_state)
-
-        target_transform_left, self.target_left_state = self.trajectory_animation.get_pose("left_gripper", self.sim_time)
-        self.target_transform_left = wp.transform(*target_transform_left)
-        target_transform_right, self.target_right_state = self.trajectory_animation.get_pose("right_gripper", self.sim_time)
-        self.target_transform_right = wp.transform(*target_transform_right)
-        # print('time', self.sim_time, ' target transform left:', self.target_transform_left, 'left state', self.target_left_state)
-        # print('time', self.sim_time, ' target transform right:', self.target_transform_right, 'right state', self.target_right_state)
-
-    def _interpolate_transform(self, curr_tf, next_tf, t):
-        pos_curr = wp.transform_get_translation(curr_tf)
-        pos_next = wp.transform_get_translation(next_tf)
-        pos_interp = pos_curr + (pos_next - pos_curr) * t
-
-        rot_curr = wp.transform_get_rotation(curr_tf)
-        rot_next = wp.transform_get_rotation(next_tf)
-        rot_interp = wp.quat_slerp(rot_curr, rot_next, t)
-
-        return pos_interp, rot_interp
-
-
-    def _push_targets_from_trajectories_substeps_i(self, substeps_i=1):
-        """Read transform from trajectory and push into IK objectives, but it is split into num_substeps parts. it set the targets for part i.
-        """
-        # evenly split the motion between current and target transforms across substeps
-        substeps_total = max(1, self.sim_substeps)
-        ratio = float(np.clip(substeps_i, 0, substeps_total)) / float(substeps_total)
-
-        left_pos_interp, left_rot_interp = self._interpolate_transform(self.curr_transform_left, self.target_transform_left, ratio)
-        right_pos_interp, right_rot_interp = self._interpolate_transform(self.curr_transform_right, self.target_transform_right, ratio)
-        # NOTE: This interpolation bases all substeps on the frame-start pose (curr_transform_* captured once per frame).
-        # For very long motions or if high accuracy is needed, a progressive rebase approach can be used:
-        #    after each physics step, set curr_transform_* to the integrated pose and interpolate the *remaining* distance.
-        # That avoids accumulating IK error when solver can't exactly reach each waypoint. Current approach is simpler
-        # and provides predictable, evenly spaced waypoints.
-        self.l_pos_obj.set_target_position(0, left_pos_interp)
-        self.l_rot_obj.set_target_rotation(0, wp.vec4(left_rot_interp[0], left_rot_interp[1], left_rot_interp[2], left_rot_interp[3]))
-        self.open_left_gripper = self.curr_left_state + (self.target_left_state - self.curr_left_state) / self.sim_substeps * substeps_i
-        # self.open_left_gripper = self.target_left_state
-        self.r_pos_obj.set_target_position(0, right_pos_interp)
-        self.r_rot_obj.set_target_rotation(0, wp.vec4(right_rot_interp[0], right_rot_interp[1], right_rot_interp[2], right_rot_interp[3]))
-        self.open_right_gripper = self.curr_right_state + (self.target_right_state - self.curr_right_state) / self.sim_substeps * substeps_i
-        # self.open_right_gripper = self.target_right_state
-        # print('time', self.sim_time, 'substep', substeps_i, '/', substeps_total, 'left waypoint:', left_waypoint, 'left state', self.open_left_gripper)
-        # print('time', self.sim_time, 'substep', substeps_i, '/', substeps_total, 'right waypoint:', right_waypoint, 'right state', self.open_right_gripper)
-
-
     # ----------------------------------------------------------------------
     # Template API
     # ----------------------------------------------------------------------
     def step(self):
         if self.sim_time == 0.0:
             newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
+            self.left_gripper_state = self.open_left_gripper
+            self.right_gripper_state = self.open_right_gripper
 
-        self.get_curr_gripper_transform_and_state()
-        for i in range(self.sim_substeps):
-            # if self.animation_type == AnimationType.INTERACTIVE:
-            #     self._push_targets_from_gizmos()
+        print('step time', self.sim_time)
 
-            if self.animation_type == AnimationType.TRAJECTORY:
-                # self._push_targets_from_trajectories()
-                # Interpolate target for substep i+1. This uses the frame-start transform as origin
-                # and ensures a smooth waypoint progression. (Potential enhancement: make this progressive
-                # by re-basing on the latest state each substep for very long motions.)
-                self._push_targets_from_trajectories_substeps_i(i+1)
+        if self.animation_type == AnimationType.INTERACTIVE:
+            self._push_targets_from_gizmos()
 
-            # IK step, update self.ik_joint_q as the target pose
-            if self.ik_graph:
-                wp.capture_launch(self.ik_graph)
-            else:
-                self.ik_simulate()
+        if self.animation_type == AnimationType.TRAJECTORY:
+            self._push_targets_from_trajectories()
 
-            ik_joint_q = self.ik_joint_q.flatten()
-            ik_joint_q_np = ik_joint_q.numpy()
+        # IK step, update self.ik_joint_q as the target pose
+        if self.ik_graph:
+            wp.capture_launch(self.ik_graph)
+        else:
+            self.ik_simulate()
 
+        ik_joint_q = self.ik_joint_q.flatten()
+        ik_joint_q_np = ik_joint_q.numpy()
+        joint_limit_lower_np = self.model.joint_limit_lower.numpy()
+        joint_limit_upper_np = self.model.joint_limit_upper.numpy()
 
-            # # Position control for [gripper]  # kernel 
-            joint_limit_lower_np = self.model.joint_limit_lower.numpy()
-            joint_limit_upper_np = self.model.joint_limit_upper.numpy()
-            left_joint_limit_lower_np = joint_limit_lower_np[self.left_gripper_joint_indices]
-            right_joint_limit_lower_np = joint_limit_lower_np[self.right_gripper_joint_indices]
-            left_joint_limit_upper_np = joint_limit_upper_np[self.left_gripper_joint_indices]
-            right_joint_limit_upper_np = joint_limit_upper_np[self.right_gripper_joint_indices]
-            # print('joint limits:')
-            # print('upper:', joint_limit_upper_np[self.left_gripper_joint_indices])
-            # print('lower:', joint_limit_lower_np[self.left_gripper_joint_indices])
+        # Cache start-of-frame joint positions and full-frame IK target
+        q0_frame = self.state_0.joint_q.numpy()
+        q_target_frame = ik_joint_q.numpy()
+        total_move_frame = q_target_frame - q0_frame
+        print('time', self.sim_time, 'q0_frame', q0_frame.flatten()[self.left_gripper_joint_indices], 
+        'q_target_frame', q_target_frame.flatten()[self.left_gripper_joint_indices], 
+        'total_move_frame', total_move_frame.flatten()[self.left_gripper_joint_indices],
+        'controllable_joint_indices', self.left_gripper_joint_indices)
+
+        for s in range(self.sim_substeps):
+        # Position control for [gripper]
             if self.gripper_control_type == GripperControlType.TARGET_POSITION:
-                ik_joint_q_np[self.left_gripper_joint_indices] = left_joint_limit_lower_np + self.open_left_gripper * (left_joint_limit_upper_np - left_joint_limit_lower_np)
-                ik_joint_q_np[self.right_gripper_joint_indices] = right_joint_limit_lower_np + self.open_right_gripper * (right_joint_limit_upper_np - right_joint_limit_lower_np)
+                # read gripper joint limits
+                left_lower = joint_limit_lower_np[self.left_gripper_joint_indices]
+                left_upper = joint_limit_upper_np[self.left_gripper_joint_indices]
+                right_lower = joint_limit_lower_np[self.right_gripper_joint_indices]
+                right_upper = joint_limit_upper_np[self.right_gripper_joint_indices]
 
-            # Position control for [gripper]
-            # joint_limit_lower_np = self.model.joint_limit_lower.numpy()
-            # joint_limit_upper_np = self.model.joint_limit_upper.numpy()
-            # if self.gripper_control_type == GripperControlType.TARGET_POSITION:
-            #     if self.open_left_gripper:
-            #         ik_joint_q_np[self.left_gripper_joint_indices] = joint_limit_upper_np[self.left_gripper_joint_indices]
-            #     else:
-            #         ik_joint_q_np[self.left_gripper_joint_indices] = joint_limit_lower_np[self.left_gripper_joint_indices]
+                # interpolate openness from last frame state -> target over substeps
+                t = float(s + 1) / float(self.sim_substeps)
+                left_open = (1.0 - t) * float(self.left_gripper_state) + t * float(self.open_left_gripper)
+                right_open = (1.0 - t) * float(self.right_gripper_state) + t * float(self.open_right_gripper)
 
-            #     if self.open_right_gripper:
-            #         ik_joint_q_np[self.right_gripper_joint_indices] = joint_limit_upper_np[self.right_gripper_joint_indices]
-            #     else:
-            #         ik_joint_q_np[self.right_gripper_joint_indices] = joint_limit_lower_np[self.right_gripper_joint_indices]
+                left_pos_s = left_lower + left_open * (left_upper - left_lower)
+                right_pos_s = right_lower + right_open * (right_upper - right_lower)
+                if self.left_gripper_state != self.open_left_gripper:
+                    print('sim_time', self.sim_time, 'substep', s, 'left_open', left_open, 'right_open', right_open, 'open_left_gripper', self.open_left_gripper, 'open_right_gripper', self.open_right_gripper)
+                    print('left_pos_s', left_pos_s, 'right_pos_s', right_pos_s, 'upper', left_upper, 'lower', left_lower)
+
+                ik_joint_q_np[self.left_gripper_joint_indices] = left_pos_s
+                ik_joint_q_np[self.right_gripper_joint_indices] = right_pos_s
 
             ik_joint_q.assign(ik_joint_q_np)
-
-            # Align the self.state with the target body in the viewer
-            # newton.eval_fk(self.model, ik_joint_q, self.model.joint_qd, self.state)
             
-            # Joint-space blending instead of limit_joint_move:
-            # We interpolate from the current joint configuration toward the IK solution based on substep ratio.
-            # This avoids a sudden jump to the full IK pose in the first substep and removes artificial clipping logic.
-            current_q = self.state_0.joint_q.numpy()
-            target_full_q = ik_joint_q.numpy()
-            substep_ratio = float(i+1)/float(self.sim_substeps)  # 1..substeps
-            blended_q = current_q + (target_full_q - current_q) * substep_ratio
-            # Compute per-dof delta and velocity for this substep
-            move = blended_q - current_q
-            target = blended_q
-            # Limit the joint movement in one frame
-            # move, target = limit_joint_move(ik_joint_q.numpy(), self.state_0.joint_q.numpy(), 20.0, self.sim_dt)
-
+            # Uniformly split the full-frame move/target into substep parts
+            alpha = float(s + 1) / float(self.sim_substeps)
+            target = q0_frame + alpha * total_move_frame
+            move = target - self.state_0.joint_q.numpy()
+            print('time', self.sim_time, 'substep', s, 
+            'current_q', self.state_0.joint_q.numpy().flatten()[self.left_gripper_joint_indices],
+            'move', move.flatten()[self.left_gripper_joint_indices],
+            'target', target.flatten()[self.left_gripper_joint_indices], 
+            )
 
             # Set target q control for [controllable joint] and [gripper]
             joint_target_np = self.control.joint_target.numpy()
@@ -752,38 +687,24 @@ class Example:
 
             # Set joint qd for [controllable joint] and [gripper]
             joint_qd_np = self.state_0.joint_qd.numpy()
-            ik_joint_qd_np = move / self.sim_dt  # per-substep velocity from blended move
+            ik_joint_qd_np = move / self.sim_dt
             joint_qd_np[self.controllable_joint_indices] = ik_joint_qd_np[self.controllable_joint_indices]
             if self.gripper_control_type == GripperControlType.TARGET_POSITION:
                 joint_qd_np[self.left_gripper_joint_indices]=(ik_joint_qd_np[self.left_gripper_joint_indices])
                 joint_qd_np[self.right_gripper_joint_indices]=(ik_joint_qd_np[self.right_gripper_joint_indices])
             self.ik_joint_qd.assign(joint_qd_np)
             self.state_0.joint_qd.assign(joint_qd_np)
-            # NOTE: We previously printed the end-effector transform here BEFORE physics integration,
-            # which caused confusing logs (pose appeared to lag one substep). We now print AFTER the physics step below.
-            # Set joint velocity for the grippers
-            gripper_vel = 0.2
-
-            # Velocity control for [gripper]
-            if self.gripper_control_type == GripperControlType.TARGET_VELOCITY:
-                joint_target_np = self.control.joint_target.numpy()
-
-                vel = linear_map(self.open_left_gripper, -gripper_vel, gripper_vel)
-                joint_target_np[self.left_gripper_joint_indices] = vel
-                vel = linear_map(self.open_right_gripper, -gripper_vel, gripper_vel)
-                joint_target_np[self.right_gripper_joint_indices] = vel
-                self.control.joint_target.assign(joint_target_np)
-
-            # Physics step (integrates rigid + cloth). After this call state_0 is swapped to latest pose.
+            # self.state_0.joint_q.assign(target)
+            # Physics step
             if self.physics_graph:
                 wp.capture_launch(self.physics_graph)
             else:
                 self.physics_simulate()
 
-            # After physics integration, fetch and print the updated end-effector pose for this substep.
-            # body_q_np = self.state_0.body_q.numpy()
-            # transform_left_substep_i = wp.transform(*body_q_np[self.lee_index])
-            # print('substep', i+1, ' updated left end effector:', transform_left_substep_i)
+            print('time', self.sim_time, 'substep', s, 
+            'after_q', self.state_0.joint_q.numpy().flatten()[self.left_gripper_joint_indices],
+            'after_qd', self.state_0.joint_qd.numpy().flatten()[self.left_gripper_joint_indices],
+            )
 
         self.sim_time += self.frame_dt
         self.sim_frame += 1
@@ -795,6 +716,9 @@ class Example:
 
             if self.sim_frame == 32 * self.fps:
                 np.savez('lift2_manipulating_cloth.npz', joint_q=self.joint_q_seq, openness=self.openness_seq)
+        
+        self.left_gripper_state = self.open_left_gripper
+        self.right_gripper_state = self.open_right_gripper
 
 
     def test(self):

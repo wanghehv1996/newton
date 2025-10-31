@@ -563,10 +563,13 @@ def evaluate_body_particle_contact(
     bx = wp.transform_point(X_wb, contact_body_pos[contact_index])
 
     n = contact_normal[contact_index]
-
-    penetration_depth = -(wp.dot(n, particle_pos - bx) - particle_radius[particle_index])
+    radius = particle_radius[particle_index]
+    penetration_depth = -(wp.dot(n, particle_pos - bx) - radius)
+    # force = 2* k / r * (r - d) ** 2
     if penetration_depth > 0:
+        # k = mass / d^2 + 
         body_contact_force_norm = penetration_depth * soft_contact_ke
+        # body_contact_force_norm = 2.0 * 1.0 * soft_contact_ke / radius * penetration_depth * penetration_depth
         body_contact_force = n * body_contact_force_norm
         body_contact_hessian = soft_contact_ke * wp.outer(n, n)
 
