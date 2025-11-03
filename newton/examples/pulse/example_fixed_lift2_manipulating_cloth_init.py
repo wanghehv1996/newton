@@ -46,6 +46,39 @@ def limit_joint_move(tar_q, cur_q, max_qd, dt):
 
     return delta_q, delta_q + cur_q
 
+def clamp_transform_delta(current_tf, target_tf, max_translation, max_rotation):
+    """
+    Clamp the transform delta between current and target transforms.
+    Only limits displacement, not rotation.
+    
+    Args:
+        current_tf: Current transform (wp.transform)
+        target_tf: Target transform (wp.transform)
+        max_translation: Maximum allowed translation distance (meters)
+        max_rotation: Maximum allowed rotation angle (radians) - not used
+    
+    Returns:
+        Clamped target transform (wp.transform)
+    """
+    # Get current and target positions
+    current_pos = wp.transform_get_translation(current_tf)
+    target_pos = wp.transform_get_translation(target_tf)
+    
+    # Calculate position delta
+    pos_delta = target_pos - current_pos
+    pos_distance = wp.length(pos_delta)
+    
+    # Clamp position if needed
+    if pos_distance > max_translation:
+        clamped_pos = current_pos + (pos_delta / pos_distance) * max_translation
+    else:
+        clamped_pos = target_pos
+    
+    # Get target rotation (no clamping)
+    target_rot = wp.transform_get_rotation(target_tf)
+    
+    return wp.transform(clamped_pos, target_rot)
+
 def transform_diff(tf1, tf2, pos_thres=1e-3, rot_thres=1e-3):
     # Translational distance
     pos1 = wp.transform_get_translation(tf1)
@@ -136,8 +169,8 @@ class Example:
         # self.use_mujoco_cpu = True  # Use MuJoCo-CPU (stable cube grasp)
         # self.use_mujoco_cpu = False # Use MuJoCo-Warp (friction still inaccurate)
 
-        self.animation_type = AnimationType.TRAJECTORY
-        # self.animation_type = AnimationType.INTERACTIVE
+        # self.animation_type = AnimationType.TRAJECTORY
+        self.animation_type = AnimationType.INTERACTIVE
 
         # dump visualization image sequence
         self.use_dump_image = False
@@ -145,6 +178,10 @@ class Example:
 
         # dump joint q into .npz
         self.use_dump_joint = False
+
+        # Maximum displacement per frame to limit speed (meters per frame)
+        self.max_displacement_per_frame = 0.05  # 5cm per frame at 60 FPS = 3 m/s max speed
+        self.max_rotation_per_frame = 0.5  # radians per frame (~28 degrees)
 
         # VBD parameters
         if self.animation_type == AnimationType.INTERACTIVE:
@@ -392,6 +429,10 @@ class Example:
         body_q_np = self.state.body_q.numpy()
         self.lee_tf = wp.transform(*body_q_np[self.lee_index])
         self.ree_tf = wp.transform(*body_q_np[self.ree_index])
+        
+        # Store previous frame transforms for displacement limiting
+        self.prev_lee_tf = wp.transform(*body_q_np[self.lee_index])
+        self.prev_ree_tf = wp.transform(*body_q_np[self.ree_index])
 
         # ------------------------------------------------------------------
         # IK setup
@@ -552,14 +593,35 @@ class Example:
             (self.state_0, self.state_1) = (self.state_1, self.state_0)
 
     def _push_targets_from_gizmos(self):
-        """Read gizmo-updated transform and push into IK objectives."""
-        self.l_pos_obj.set_target_position(0, wp.transform_get_translation(self.lee_tf))
-        q = wp.transform_get_rotation(self.lee_tf)
+        """Read gizmo-updated transform and push into IK objectives with displacement limiting."""
+        # Clamp left end effector displacement
+        clamped_lee_tf = clamp_transform_delta(
+            self.prev_lee_tf, 
+            self.lee_tf, 
+            self.max_displacement_per_frame, 
+            self.max_rotation_per_frame
+        )
+        
+        # Clamp right end effector displacement
+        clamped_ree_tf = clamp_transform_delta(
+            self.prev_ree_tf, 
+            self.ree_tf, 
+            self.max_displacement_per_frame, 
+            self.max_rotation_per_frame
+        )
+        
+        # Set IK targets with clamped transforms
+        self.l_pos_obj.set_target_position(0, wp.transform_get_translation(clamped_lee_tf))
+        q = wp.transform_get_rotation(clamped_lee_tf)
         self.l_rot_obj.set_target_rotation(0, wp.vec4(q[0], q[1], q[2], q[3]))
 
-        self.r_pos_obj.set_target_position(0, wp.transform_get_translation(self.ree_tf))
-        q = wp.transform_get_rotation(self.ree_tf)
+        self.r_pos_obj.set_target_position(0, wp.transform_get_translation(clamped_ree_tf))
+        q = wp.transform_get_rotation(clamped_ree_tf)
         self.r_rot_obj.set_target_rotation(0, wp.vec4(q[0], q[1], q[2], q[3]))
+        
+        # Update previous transforms for next frame
+        self.prev_lee_tf = clamped_lee_tf
+        self.prev_ree_tf = clamped_ree_tf
 
         if hasattr(self.viewer, "is_key_down"):
             if self.viewer.is_key_down("1"):
@@ -572,8 +634,8 @@ class Example:
             else:
                 self.open_right_gripper = 1
 
-        print(f"Left  end effector:{self.lee_tf}")
-        print(f"Right end effector:{self.ree_tf}")
+        print(f"Left  end effector (clamped):{clamped_lee_tf}")
+        print(f"Right end effector (clamped):{clamped_ree_tf}")
 
         # self.cloth_solver.finger_indices.assign([self.open_left_gripper, self.open_left_gripper, self.open_right_gripper, self.open_right_gripper])
 
