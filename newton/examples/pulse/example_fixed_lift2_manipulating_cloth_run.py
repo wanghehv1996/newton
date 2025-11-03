@@ -344,8 +344,11 @@ class AnimationType(IntEnum):
     TRAJECTORY = 1
     """Trajectory control."""
 
-    INTERACTIVE_NEW = 2
+    INTERACTIVE_QUEUE = 2
     """Interactive control with gizmo, splits motion into 30 steps."""
+
+    INTERACTIVE_NO_QUEUE = 3
+    """Interactive control with gizmo, no queue (direct response with optimizations)."""
 
 # config the joint types
 fixed_joint_names = {
@@ -377,7 +380,7 @@ class Example:
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
         self.sim_frame = 0
-        self.sim_substeps = 10
+        self.sim_substeps = 20
         self.sim_dt = self.frame_dt / self.sim_substeps
         self._substep_index = 0
         
@@ -390,19 +393,22 @@ class Example:
         self.use_mujoco_cpu = False
         # Animation type options:
         # - AnimationType.INTERACTIVE: Direct gizmo control (continuous)
-        # - AnimationType.INTERACTIVE_NEW: Gizmo control with 30-step interpolation (queued execution)
+        # - AnimationType.INTERACTIVE_QUEUE: Gizmo control with 30-step interpolation (queued execution)
+        # - AnimationType.INTERACTIVE_NO_QUEUE: Direct gizmo control with optimizations (no queue)
         # - AnimationType.TRAJECTORY: Pre-recorded trajectory playback
-        self.animation_type = AnimationType.INTERACTIVE_NEW
+        self.animation_type = AnimationType.INTERACTIVE_QUEUE
         self.use_dump_image = False
         self.use_dump_joint = False
 
         # VBD parameters
         if self.animation_type == AnimationType.INTERACTIVE:
-            self.sim_vbd_iterations = 3    
+            self.sim_vbd_iterations = 6    
         elif self.animation_type == AnimationType.TRAJECTORY:
-            self.sim_vbd_iterations = 10
-        elif self.animation_type == AnimationType.INTERACTIVE_NEW:
             self.sim_vbd_iterations = 6
+        elif self.animation_type == AnimationType.INTERACTIVE_QUEUE:
+            self.sim_vbd_iterations = 3
+        elif self.animation_type == AnimationType.INTERACTIVE_NO_QUEUE:
+            self.sim_vbd_iterations = 3  # Balanced for real-time performance
         else:
             raise ValueError(f"Invalid animation type: {self.animation_type}")
         # Contact parameters
@@ -694,14 +700,9 @@ class Example:
         initial_lee_tf = wp.transform(*body_q_np[self.lee_index])
         initial_ree_tf = wp.transform(*body_q_np[self.ree_index])
         
-        # Interactive mode: instruction queue for smooth interpolation
-        # Each instruction executes over 0.5 seconds (30 frames at 60 FPS)
-        self.instruction_duration = 0.5  # seconds
-        self.instruction_frames = int(self.instruction_duration * self.fps)  # 30 frames at 60 FPS
-        self.current_instruction_start_time = 0.0
         # Maximum displacement per frame to limit speed (for direct gizmo control)
-        self.max_displacement_per_frame = 0.01  # 5cm per frame at 60 FPS = 3 m/s max speed
-        self.max_rotation_per_frame = 0.01  # radians per frame (~28 degrees)
+        self.max_displacement_per_frame = 0.003  # 5cm per frame at 60 FPS = 3 m/s max speed
+        self.max_rotation_per_frame = 0.03  # radians per frame 
         # Store gizmo input values (updated by viewer in render())
         # IMPORTANT: Create separate transform objects for gizmo to ensure they are independently mutable
         # Use slice assignment to copy the transform values
@@ -722,7 +723,7 @@ class Example:
             wp.transform_get_translation(initial_ree_tf),
             wp.transform_get_rotation(initial_ree_tf)
         )
-        # Store current interpolated end effector transforms
+        # Store initial end effector transforms (used for IK objective initialization)
         self.lee_tf = wp.transform(
             wp.transform_get_translation(initial_lee_tf),
             wp.transform_get_rotation(initial_lee_tf)
@@ -731,19 +732,9 @@ class Example:
             wp.transform_get_translation(initial_ree_tf),
             wp.transform_get_rotation(initial_ree_tf)
         )
-        # Store target states (from gizmo or keyboard, may be clamped)
-        self.target_lee_tf = self.lee_tf  # Target left end effector transform
-        self.target_ree_tf = self.ree_tf  # Target right end effector transform
-        self.target_left_gripper = 1.0    # Target left gripper openness
-        self.target_right_gripper = 1.0   # Target right gripper openness
-        # Store start states for interpolation
-        self.start_lee_tf = self.lee_tf   # Start left end effector transform
-        self.start_ree_tf = self.ree_tf   # Start right end effector transform
-        self.start_left_gripper = 1.0      # Start left gripper openness
-        self.start_right_gripper = 1.0     # Start right gripper openness
 
-        # INTERACTIVE_NEW mode: trajectory queue for 30-step execution
-        self.trajectory_queue_size = 30
+        # INTERACTIVE_QUEUE mode: trajectory queue for 30-step execution
+        self.trajectory_queue_size = 10
         # Pre-allocate queues to avoid memory allocation during runtime
         # Each queue element is a wp.transform (7 floats: 3 pos + 4 quat)
         self.lee_tf_queue = [wp.transform() for _ in range(self.trajectory_queue_size)]
@@ -755,6 +746,11 @@ class Example:
         self.cached_ree_target_tf = self.ree_tf  # Current right end effector target
         # Pre-compute interpolation alphas for trajectory generation (optimization)
         self.trajectory_alphas = np.linspace(1.0/self.trajectory_queue_size, 1.0, self.trajectory_queue_size, dtype=np.float32)
+        
+        # Pre-allocate buffers for IK target updates to avoid repeated array creation
+        # These are reused every frame to minimize allocation overhead
+        self._ik_pos_buffer = np.zeros((1, 3), dtype=np.float32)
+        self._ik_rot_buffer = np.zeros((1, 4), dtype=np.float32)
 
         # ------------------------------------------------------------------
         # IK setup
@@ -845,7 +841,7 @@ class Example:
             solver='newton',
             cone="elliptic",
             use_mujoco_cpu=self.use_mujoco_cpu,
-            use_mujoco_contacts=False,
+            use_mujoco_contacts=True,
             contact_stiffness_time_const=self.sim_dt
         )
 
@@ -964,14 +960,34 @@ class Example:
             self.max_rotation_per_frame
         )
         
-        # Set IK targets with clamped transforms
-        self.l_pos_obj.set_target_position(0, wp.transform_get_translation(clamped_lee_tf))
-        q = wp.transform_get_rotation(clamped_lee_tf)
-        self.l_rot_obj.set_target_rotation(0, wp.vec4(q[0], q[1], q[2], q[3]))
-
-        self.r_pos_obj.set_target_position(0, wp.transform_get_translation(clamped_ree_tf))
-        q = wp.transform_get_rotation(clamped_ree_tf)
-        self.r_rot_obj.set_target_rotation(0, wp.vec4(q[0], q[1], q[2], q[3]))
+        # Set IK targets with clamped transforms (optimized: direct array assignment)
+        lee_pos = wp.transform_get_translation(clamped_lee_tf)
+        lee_rot = wp.transform_get_rotation(clamped_lee_tf)
+        ree_pos = wp.transform_get_translation(clamped_ree_tf)
+        ree_rot = wp.transform_get_rotation(clamped_ree_tf)
+        
+        # Use pre-allocated buffers to avoid array creation and kernel launch overhead
+        self._ik_pos_buffer[0, 0] = lee_pos[0]
+        self._ik_pos_buffer[0, 1] = lee_pos[1]
+        self._ik_pos_buffer[0, 2] = lee_pos[2]
+        self.l_pos_obj.target_positions.assign(self._ik_pos_buffer)
+        
+        self._ik_rot_buffer[0, 0] = lee_rot[0]
+        self._ik_rot_buffer[0, 1] = lee_rot[1]
+        self._ik_rot_buffer[0, 2] = lee_rot[2]
+        self._ik_rot_buffer[0, 3] = lee_rot[3]
+        self.l_rot_obj.target_rotations.assign(self._ik_rot_buffer)
+        
+        self._ik_pos_buffer[0, 0] = ree_pos[0]
+        self._ik_pos_buffer[0, 1] = ree_pos[1]
+        self._ik_pos_buffer[0, 2] = ree_pos[2]
+        self.r_pos_obj.target_positions.assign(self._ik_pos_buffer)
+        
+        self._ik_rot_buffer[0, 0] = ree_rot[0]
+        self._ik_rot_buffer[0, 1] = ree_rot[1]
+        self._ik_rot_buffer[0, 2] = ree_rot[2]
+        self._ik_rot_buffer[0, 3] = ree_rot[3]
+        self.r_rot_obj.target_rotations.assign(self._ik_rot_buffer)
         
         # Update previous transforms for next frame
         self.prev_gizmo_lee_tf = clamped_lee_tf
@@ -1044,7 +1060,7 @@ class Example:
         return (lee_pos_diff > threshold_pos or lee_rot_diff > threshold_rot or
                 ree_pos_diff > threshold_pos or ree_rot_diff > threshold_rot)
 
-    def _push_targets_from_gizmos_new(self):
+    def _push_targets_from_gizmos_queue(self):
         """Read gizmo-updated transform and create a 30-step trajectory queue.
         
         This method allows continuous gizmo input and creates smooth interpolated trajectories:
@@ -1138,14 +1154,38 @@ class Example:
             target_lee_tf = self.lee_tf_queue[self.queue_index]
             target_ree_tf = self.ree_tf_queue[self.queue_index]
             
-            # Set IK targets
-            self.l_pos_obj.set_target_position(0, wp.transform_get_translation(target_lee_tf))
-            q = wp.transform_get_rotation(target_lee_tf)
-            self.l_rot_obj.set_target_rotation(0, wp.vec4(q[0], q[1], q[2], q[3]))
+            # Optimization: Direct GPU array assignment to avoid multiple kernel launches
+            # Each set_target_* call launches a GPU kernel, causing ~0.01-0.05ms overhead per call
+            # Instead, we directly write to GPU arrays using pre-allocated buffers
+            lee_pos = wp.transform_get_translation(target_lee_tf)
+            lee_rot = wp.transform_get_rotation(target_lee_tf)
+            ree_pos = wp.transform_get_translation(target_ree_tf)
+            ree_rot = wp.transform_get_rotation(target_ree_tf)
             
-            self.r_pos_obj.set_target_position(0, wp.transform_get_translation(target_ree_tf))
-            q = wp.transform_get_rotation(target_ree_tf)
-            self.r_rot_obj.set_target_rotation(0, wp.vec4(q[0], q[1], q[2], q[3]))
+            # Reuse pre-allocated buffers to avoid array creation overhead
+            # Left end effector
+            self._ik_pos_buffer[0, 0] = lee_pos[0]
+            self._ik_pos_buffer[0, 1] = lee_pos[1]
+            self._ik_pos_buffer[0, 2] = lee_pos[2]
+            self.l_pos_obj.target_positions.assign(self._ik_pos_buffer)
+            
+            self._ik_rot_buffer[0, 0] = lee_rot[0]
+            self._ik_rot_buffer[0, 1] = lee_rot[1]
+            self._ik_rot_buffer[0, 2] = lee_rot[2]
+            self._ik_rot_buffer[0, 3] = lee_rot[3]
+            self.l_rot_obj.target_rotations.assign(self._ik_rot_buffer)
+            
+            # Right end effector
+            self._ik_pos_buffer[0, 0] = ree_pos[0]
+            self._ik_pos_buffer[0, 1] = ree_pos[1]
+            self._ik_pos_buffer[0, 2] = ree_pos[2]
+            self.r_pos_obj.target_positions.assign(self._ik_pos_buffer)
+            
+            self._ik_rot_buffer[0, 0] = ree_rot[0]
+            self._ik_rot_buffer[0, 1] = ree_rot[1]
+            self._ik_rot_buffer[0, 2] = ree_rot[2]
+            self._ik_rot_buffer[0, 3] = ree_rot[3]
+            self.r_rot_obj.target_rotations.assign(self._ik_rot_buffer)
             
             # Update cached targets (avoids GPU sync in next trajectory generation)
             self.cached_lee_target_tf = target_lee_tf
@@ -1158,6 +1198,85 @@ class Example:
             if self.queue_index >= len(self.lee_tf_queue):
                 self.queue_executing = False
                 self.queue_index = 0
+
+    def _push_targets_from_gizmos_no_queue(self):
+        """Read gizmo-updated transform and push into IK objectives directly (no queue).
+        
+        This mode combines the real-time response of INTERACTIVE mode with the 
+        optimizations from INTERACTIVE_QUEUE mode (direct array assignment, pre-allocated buffers).
+        
+        Key features:
+        - Direct gizmo response (no 30-step interpolation)
+        - Displacement limiting for safety
+        - Optimized GPU data transfer
+        - Keyboard gripper control
+        """
+        # Handle gripper control via keyboard (immediate response)
+        if hasattr(self.viewer, "is_key_down"):
+            if self.viewer.is_key_down("1"):
+                self.open_left_gripper -= 0.05
+            else:
+                self.open_left_gripper += 0.05
+
+            if self.viewer.is_key_down("2"):
+                self.open_right_gripper -= 0.05
+            else:
+                self.open_right_gripper += 0.05
+                
+            self.open_left_gripper = np.clip(self.open_left_gripper, 0.0, 1.0)
+            self.open_right_gripper = np.clip(self.open_right_gripper, 0.0, 1.0)
+        
+        # Clamp left end effector displacement
+        clamped_lee_tf = clamp_transform_delta(
+            self.prev_gizmo_lee_tf, 
+            self.gizmo_lee_tf, 
+            self.max_displacement_per_frame, 
+            self.max_rotation_per_frame
+        )
+        
+        # Clamp right end effector displacement
+        clamped_ree_tf = clamp_transform_delta(
+            self.prev_gizmo_ree_tf, 
+            self.gizmo_ree_tf, 
+            self.max_displacement_per_frame, 
+            self.max_rotation_per_frame
+        )
+        
+        # Extract transform components
+        lee_pos = wp.transform_get_translation(clamped_lee_tf)
+        lee_rot = wp.transform_get_rotation(clamped_lee_tf)
+        ree_pos = wp.transform_get_translation(clamped_ree_tf)
+        ree_rot = wp.transform_get_rotation(clamped_ree_tf)
+        
+        # Optimized: Use pre-allocated buffers and direct array assignment
+        # This avoids kernel launch overhead from set_target_* methods
+        # Left end effector
+        self._ik_pos_buffer[0, 0] = lee_pos[0]
+        self._ik_pos_buffer[0, 1] = lee_pos[1]
+        self._ik_pos_buffer[0, 2] = lee_pos[2]
+        self.l_pos_obj.target_positions.assign(self._ik_pos_buffer)
+        
+        self._ik_rot_buffer[0, 0] = lee_rot[0]
+        self._ik_rot_buffer[0, 1] = lee_rot[1]
+        self._ik_rot_buffer[0, 2] = lee_rot[2]
+        self._ik_rot_buffer[0, 3] = lee_rot[3]
+        self.l_rot_obj.target_rotations.assign(self._ik_rot_buffer)
+        
+        # Right end effector
+        self._ik_pos_buffer[0, 0] = ree_pos[0]
+        self._ik_pos_buffer[0, 1] = ree_pos[1]
+        self._ik_pos_buffer[0, 2] = ree_pos[2]
+        self.r_pos_obj.target_positions.assign(self._ik_pos_buffer)
+        
+        self._ik_rot_buffer[0, 0] = ree_rot[0]
+        self._ik_rot_buffer[0, 1] = ree_rot[1]
+        self._ik_rot_buffer[0, 2] = ree_rot[2]
+        self._ik_rot_buffer[0, 3] = ree_rot[3]
+        self.r_rot_obj.target_rotations.assign(self._ik_rot_buffer)
+        
+        # Update previous transforms for next frame
+        self.prev_gizmo_lee_tf = clamped_lee_tf
+        self.prev_gizmo_ree_tf = clamped_ree_tf
 
     def _update_disabled_shapes(self):
         """Update GPU array of disabled shapes based on gripper states.
@@ -1372,15 +1491,25 @@ class Example:
     def _push_targets_from_trajectories(self):
         """Read transform from trajectory and push into IK objectives.
         
-        Optimization: Direct unpacking and minimal intermediate operations.
+        Optimization: Direct array assignment instead of kernel launches.
         """
         # Left gripper trajectory
         transform_data, state = self.trajectory_animation.get_pose("left_gripper", self.sim_time)
         lee_transform = wp.transform(*transform_data)
         lee_pos = wp.transform_get_translation(lee_transform)
         lee_rot = wp.transform_get_rotation(lee_transform)
-        self.l_pos_obj.set_target_position(0, lee_pos)
-        self.l_rot_obj.set_target_rotation(0, wp.vec4(lee_rot[0], lee_rot[1], lee_rot[2], lee_rot[3]))
+        
+        # Direct array assignment to avoid kernel launch overhead
+        self._ik_pos_buffer[0, 0] = lee_pos[0]
+        self._ik_pos_buffer[0, 1] = lee_pos[1]
+        self._ik_pos_buffer[0, 2] = lee_pos[2]
+        self.l_pos_obj.target_positions.assign(self._ik_pos_buffer)
+        
+        self._ik_rot_buffer[0, 0] = lee_rot[0]
+        self._ik_rot_buffer[0, 1] = lee_rot[1]
+        self._ik_rot_buffer[0, 2] = lee_rot[2]
+        self._ik_rot_buffer[0, 3] = lee_rot[3]
+        self.l_rot_obj.target_rotations.assign(self._ik_rot_buffer)
         self.open_left_gripper = state
 
         # Right gripper trajectory
@@ -1388,8 +1517,18 @@ class Example:
         ree_transform = wp.transform(*transform_data)
         ree_pos = wp.transform_get_translation(ree_transform)
         ree_rot = wp.transform_get_rotation(ree_transform)
-        self.r_pos_obj.set_target_position(0, ree_pos)
-        self.r_rot_obj.set_target_rotation(0, wp.vec4(ree_rot[0], ree_rot[1], ree_rot[2], ree_rot[3]))
+        
+        # Direct array assignment to avoid kernel launch overhead
+        self._ik_pos_buffer[0, 0] = ree_pos[0]
+        self._ik_pos_buffer[0, 1] = ree_pos[1]
+        self._ik_pos_buffer[0, 2] = ree_pos[2]
+        self.r_pos_obj.target_positions.assign(self._ik_pos_buffer)
+        
+        self._ik_rot_buffer[0, 0] = ree_rot[0]
+        self._ik_rot_buffer[0, 1] = ree_rot[1]
+        self._ik_rot_buffer[0, 2] = ree_rot[2]
+        self._ik_rot_buffer[0, 3] = ree_rot[3]
+        self.r_rot_obj.target_rotations.assign(self._ik_rot_buffer)
         self.open_right_gripper = state
 
     def step(self):
@@ -1399,15 +1538,18 @@ class Example:
             self.left_gripper_state = self.open_left_gripper
             self.right_gripper_state = self.open_right_gripper
 
-        # Avoid print in INTERACTIVE_NEW mode for better GPU performance
-        if self.animation_type != AnimationType.INTERACTIVE_NEW:
+        # Avoid print in INTERACTIVE_QUEUE and INTERACTIVE_NO_QUEUE modes for better GPU performance
+        if self.animation_type not in (AnimationType.INTERACTIVE_QUEUE, AnimationType.INTERACTIVE_NO_QUEUE):
             print('Step time:', self.sim_time)
 
         if self.animation_type == AnimationType.INTERACTIVE:
             self._push_targets_from_gizmos()
 
-        if self.animation_type == AnimationType.INTERACTIVE_NEW:
-            self._push_targets_from_gizmos_new()
+        if self.animation_type == AnimationType.INTERACTIVE_QUEUE:
+            self._push_targets_from_gizmos_queue()
+
+        if self.animation_type == AnimationType.INTERACTIVE_NO_QUEUE:
+            self._push_targets_from_gizmos_no_queue()
 
         if self.animation_type == AnimationType.TRAJECTORY:
             self._push_targets_from_trajectories()
@@ -1456,8 +1598,8 @@ class Example:
         if self.last_step_time is not None:
             step_duration = current_time - self.last_step_time
             current_fps = 1.0 / step_duration if step_duration > 0 else 0            
-            # Print FPS info (skip frequent printing in INTERACTIVE_NEW mode for better performance)
-            if self.animation_type != AnimationType.INTERACTIVE_NEW or self.sim_frame % 30 == 0:
+            # Print FPS info (skip frequent printing in GPU-optimized interactive modes for better performance)
+            if self.animation_type not in (AnimationType.INTERACTIVE_QUEUE, AnimationType.INTERACTIVE_NO_QUEUE) or self.sim_frame % 30 == 0:
                 print(f'Frame {self.sim_frame}: FPS = {current_fps:.2f}, Step time = {step_duration*1000:.2f}ms')
         
         self.last_step_time = current_time
@@ -1485,9 +1627,15 @@ class Example:
             self.viewer.log_gizmo("left_target_tcp", self.gizmo_lee_tf)
             self.viewer.log_gizmo("right_target_tcp", self.gizmo_ree_tf)
         
-        if self.animation_type == AnimationType.INTERACTIVE_NEW:
-            # Register gizmo for INTERACTIVE_NEW mode
+        if self.animation_type == AnimationType.INTERACTIVE_QUEUE:
+            # Register gizmo for INTERACTIVE_QUEUE mode
             # Always accept gizmo input, will create new trajectory when moved
+            self.viewer.log_gizmo("left_target_tcp", self.gizmo_lee_tf)
+            self.viewer.log_gizmo("right_target_tcp", self.gizmo_ree_tf)
+        
+        if self.animation_type == AnimationType.INTERACTIVE_NO_QUEUE:
+            # Register gizmo for INTERACTIVE_NO_QUEUE mode
+            # Direct gizmo control with optimizations
             self.viewer.log_gizmo("left_target_tcp", self.gizmo_lee_tf)
             self.viewer.log_gizmo("right_target_tcp", self.gizmo_ree_tf)
         
@@ -1497,8 +1645,8 @@ class Example:
         self.viewer.end_frame()
 
         # Only synchronize for non-GPU-optimized modes
-        # For INTERACTIVE_NEW, rely on implicit synchronization at render time
-        if self.animation_type != AnimationType.INTERACTIVE_NEW:
+        # For INTERACTIVE_QUEUE and INTERACTIVE_NO_QUEUE, rely on implicit synchronization at render time
+        if self.animation_type not in (AnimationType.INTERACTIVE_QUEUE, AnimationType.INTERACTIVE_NO_QUEUE):
             wp.synchronize()
 
         if self.use_dump_image:

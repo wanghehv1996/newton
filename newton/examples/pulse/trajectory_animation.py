@@ -152,7 +152,7 @@ class KeyFrameTrajectoryAnimation:
         }
 
         # Densify keyframes for smoother playback (60 FPS)
-        self.resample(fps=60.0)
+        self.resample(fps=30.0)
 
     def get_pose(self, key, time):
 
