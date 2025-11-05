@@ -266,7 +266,7 @@ def _update_control_kernel(
         ik_joint_qd[ci] = v_c
         state_qd[ci] = v_c
 
-def clamp_transform_delta(current_tf, target_tf, max_translation, max_rotation):
+def clamp_transform_delta(current_tf, target_tf, max_translation, max_rotation, stats_dict=None):
     """
     Clamp the transform delta between current and target transforms.
     Limits both displacement and rotation.
@@ -276,6 +276,8 @@ def clamp_transform_delta(current_tf, target_tf, max_translation, max_rotation):
         target_tf: Target transform (wp.transform)
         max_translation: Maximum allowed translation distance (meters)
         max_rotation: Maximum allowed rotation angle (radians)
+        debug_info: Optional debug label string for printing clamp information
+        stats_dict: Optional dictionary to update with clamping statistics
     
     Returns:
         Clamped target transform (wp.transform)
@@ -286,11 +288,13 @@ def clamp_transform_delta(current_tf, target_tf, max_translation, max_rotation):
     
     # Calculate position delta
     pos_delta = target_pos - current_pos
-    pos_distance = wp.length(pos_delta)
+    pos_distance = float(wp.length(pos_delta))
     
     # Clamp position if needed
+    pos_clamped = False
     if pos_distance > max_translation:
         clamped_pos = current_pos + (pos_delta / pos_distance) * max_translation
+        pos_clamped = True
     else:
         clamped_pos = target_pos
     
@@ -305,16 +309,28 @@ def clamp_transform_delta(current_tf, target_tf, max_translation, max_rotation):
     
     # Get rotation angle from quaternion
     # For quaternion (w, x, y, z), angle = 2 * acos(w)
-    rot_angle = 2.0 * wp.acos(wp.clamp(rot_delta[3], -1.0, 1.0))  # w is at index 3
+    rot_angle = float(2.0 * wp.acos(wp.clamp(rot_delta[3], -1.0, 1.0)))  # w is at index 3
     
     # Clamp rotation if needed
+    rot_clamped = False
     if rot_angle > max_rotation:
         # Interpolate between current and target rotation
         t = max_rotation / rot_angle
         clamped_rot = wp.quat_slerp(current_rot, target_rot, t)
+        rot_clamped = True
     else:
         clamped_rot = target_rot
     
+    # Update statistics if provided
+    if stats_dict is not None:
+        if pos_clamped:
+            stats_dict['pos_clamp_count'] += 1
+        if rot_clamped:
+            stats_dict['rot_clamp_count'] += 1
+        stats_dict['total_frames'] += 1
+        stats_dict['max_pos_distance'] = max(stats_dict['max_pos_distance'], pos_distance)
+        stats_dict['max_rot_angle'] = max(stats_dict['max_rot_angle'], rot_angle)
+        
     return wp.transform(clamped_pos, clamped_rot)
 
 from enum import IntEnum
@@ -350,6 +366,9 @@ class AnimationType(IntEnum):
     INTERACTIVE_NO_QUEUE = 3
     """Interactive control with gizmo, no queue (direct response with optimizations)."""
 
+    QUEUE_NO_CLAMP = 4
+    """Interactive control with gizmo and queue, but without displacement clamping."""
+
 # config the joint types
 fixed_joint_names = {
     "fixed_base", 
@@ -374,43 +393,196 @@ right_gripper_joint_names = {"fr_joint7", "fr_joint8",}
 
 
 class Example:
-    def __init__(self, viewer):
-        # frame timing
-        self.fps = 30
+    """Example class for lift2 robot manipulating cloth simulation.
+    
+    This class sets up a dual-arm robot (lift2) with cloth manipulation capabilities,
+    including IK control, physics simulation, and interactive/trajectory-based animation.
+    """
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Constants
+    # ═══════════════════════════════════════════════════════════════════════════
+    IK_ITERATIONS = 24
+    
+    # Joint control gains
+    ARM_JOINT_KE = 3000.0
+    ARM_JOINT_KD = 10.0
+    GRIPPER_JOINT_KE = 3000.0
+    GRIPPER_JOINT_KD = 10.0
+    
+    # Gripper limits
+    GRIPPER_LIMIT_LOWER = 0.005  # Leave a small gap to avoid penetration
+    GRIPPER_LIMIT_UPPER = 0.044
+    
+    # Robot pose
+    ROBOT_BASE_HEIGHT = 0.17  # meters
+    
+    # Scene objects
+    TABLE_POS = wp.vec3(1.0, 0.0, 0.201)
+    TABLE_SIZE = (0.6, 0.6, 0.2)  # half extents
+    BOX_POS = wp.vec3(0.6, 0.0, 0.43)
+    BOX_SIZE = 0.03  # half extent
+    BOX_DENSITY = 100.0
+    
+    # Cloth properties
+    CLOTH_POS = wp.vec3(0.7, 0.0, 0.5)
+    CLOTH_ROTATION_ANGLE = np.pi * 0.5
+    CLOTH_DENSITY = 0.2
+    CLOTH_SCALE = 0.01
+    
+    def __init__(self, viewer, args):
+        """Initialize the simulation example.
+        
+        Args:
+            viewer: Newton viewer instance for visualization
+            args: Command-line arguments containing simulation parameters
+        """
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 1. Timing and Performance Tracking
+        # ═══════════════════════════════════════════════════════════════════════════
+        self.fps = args.fps
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
         self.sim_frame = 0
-        self.sim_substeps = 20
+        self.sim_substeps = args.sim_substeps
         self.sim_dt = self.frame_dt / self.sim_substeps
         self._substep_index = 0
-        
-        # FPS tracking
         self.last_step_time = None
-        self.fps_window_size = 30  # Average over 30 frames
+        self.fps_window_size = 30
         
-
-        self.gripper_control_type = GripperControlType.TARGET_POSITION
-        self.use_mujoco_cpu = False
-        # Animation type options:
-        # - AnimationType.INTERACTIVE: Direct gizmo control (continuous)
-        # - AnimationType.INTERACTIVE_QUEUE: Gizmo control with 30-step interpolation (queued execution)
-        # - AnimationType.INTERACTIVE_NO_QUEUE: Direct gizmo control with optimizations (no queue)
-        # - AnimationType.TRAJECTORY: Pre-recorded trajectory playback
-        self.animation_type = AnimationType.INTERACTIVE_QUEUE
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 2. Command-Line Arguments
+        # ═══════════════════════════════════════════════════════════════════════════
+        self.gripper_control_type = GripperControlType(args.gripper_control_type)
+        self.animation_type = AnimationType(args.animation_type)
+        self.use_mujoco_cpu = args.use_mujoco_cpu
+        self.sim_vbd_iterations = args.vbd_iterations
+        self.trajectory_queue_size = args.trajectory_queue_size
+        self.queue_executing = False
+        
+        # Motion limits for gizmo control
+        self.max_displacement_per_frame = args.max_displacement_per_frame
+        self.max_rotation_per_frame = args.max_rotation_per_frame
+        print(f"Motion limits: displacement={self.max_displacement_per_frame*1000:.1f}mm/frame, rotation={np.degrees(self.max_rotation_per_frame):.1f}°/frame")
+        
         self.use_dump_image = False
         self.use_dump_joint = False
+        
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 3. Physics Parameters
+        # ═══════════════════════════════════════════════════════════════════════════
+        self._init_physics_parameters()
+        
+        self.viewer = viewer
 
-        # VBD parameters
-        if self.animation_type == AnimationType.INTERACTIVE:
-            self.sim_vbd_iterations = 6    
-        elif self.animation_type == AnimationType.TRAJECTORY:
-            self.sim_vbd_iterations = 6
-        elif self.animation_type == AnimationType.INTERACTIVE_QUEUE:
-            self.sim_vbd_iterations = 3
-        elif self.animation_type == AnimationType.INTERACTIVE_NO_QUEUE:
-            self.sim_vbd_iterations = 3  # Balanced for real-time performance
-        else:
-            raise ValueError(f"Invalid animation type: {self.animation_type}")
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 4. Build Robot Model
+        # ═══════════════════════════════════════════════════════════════════════════
+        franka = self._build_robot_model()
+        
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 5. Identify Joint Groups and End Effectors
+        # ═══════════════════════════════════════════════════════════════════════════
+        self._identify_bodies_and_joints(franka)
+        
+        # Initialize joint recording if needed
+        if self.use_dump_joint:
+            self.joint_q_seq = np.empty((0, franka.joint_dof_count), dtype=np.float32)
+            self.openness_seq = np.empty((0, 2), dtype=np.float32)
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 6. Configure Joint Controllers
+        # ═══════════════════════════════════════════════════════════════════════════
+        self.robot_joint_q_cnt = len(franka.joint_q)
+        self._configure_joint_controllers(franka)
+        
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 7. Add Scene Objects (Table, Box, Cloth)
+        # ═══════════════════════════════════════════════════════════════════════════
+        self._add_scene_objects(franka)
+        
+        franka.color()
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 8. Finalize Model and Initialize Computational Components
+        # ═══════════════════════════════════════════════════════════════════════════
+        self.model = franka.finalize(requires_grad=False)
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 9. Setup Contact Filtering for Gripper
+        # ═══════════════════════════════════════════════════════════════════════════
+        self._setup_contact_filtering()
+        
+        # Apply cloth parameters to model
+        self.model.soft_contact_ke = self.soft_contact_ke
+        self.model.soft_contact_kd = self.soft_contact_kd
+        self.model.soft_contact_mu = self.self_contact_friction
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 10. Initialize GPU Buffers and Compute Graphs
+        # ═══════════════════════════════════════════════════════════════════════════
+        self._init_gpu_buffers()
+        
+        # Warp compute graphs (initialized later in capture())
+        self.ik_graph = None
+        self.physics_graph = None
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 11. Setup Viewer
+        # ═══════════════════════════════════════════════════════════════════════════
+        self._setup_viewer()
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 12. Initialize Simulation States
+        # ═══════════════════════════════════════════════════════════════════════════
+        self.state = self.model.state()
+        self.state_0 = self.model.state()
+        self.state_1 = self.model.state()
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state)
+        self.control = self.model.control()
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 13. Initialize End Effector Control
+        # ═══════════════════════════════════════════════════════════════════════════
+        self._init_end_effector_control()
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 14. Initialize Trajectory Queue (for INTERACTIVE_QUEUE mode)
+        # ═══════════════════════════════════════════════════════════════════════════
+        self._init_trajectory_queue()
+        
+        # Pre-allocate buffers for IK target updates
+        self._ik_pos_buffer = np.zeros((1, 3), dtype=np.float32)
+        self._ik_rot_buffer = np.zeros((1, 4), dtype=np.float32)
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 15. Setup IK Objectives
+        # ═══════════════════════════════════════════════════════════════════════════
+        self._setup_ik_objectives()
+        
+        # Variables the IK solver will update
+        self.ik_joint_q = wp.array(self.model.joint_q, shape=(1, self.model.joint_coord_count))
+        self.ik_joint_qd = wp.array(self.model.joint_qd, shape=(self.model.joint_dof_count))
+        self.ik_iters = self.IK_ITERATIONS
+
+        # Trajectory animation (for TRAJECTORY mode)
+        self.trajectory_animation = KeyFrameTrajectoryAnimation()
+        self.trajectory_animation.init_lift2_folding()
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 16. Initialize Solvers
+        # ═══════════════════════════════════════════════════════════════════════════
+        self._init_solvers()
+        
+        # Capture CUDA graphs for better performance
+        self.capture()
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Helper Methods for Initialization
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    def _init_physics_parameters(self):
+        """Initialize physics and material parameters."""
         # Contact parameters
         self.cloth_particle_radius = 0.008
         self.cloth_body_contact_margin = 0.01
@@ -422,167 +594,173 @@ class Example:
         self.table_friction = 0.25
         self.self_contact_friction = 0.25
 
-        # Elasticity parameters
+        # Elasticity parameters for cloth
         self.tri_ke = 1e2
         self.tri_ka = 1e2
         self.tri_kd = 1.5e-6
         self.bending_ke = 1e-4
         self.bending_kd = 1e-3
-
-        self.viewer = viewer
-
-        # ------------------------------------------------------------------
-        # Build a single ARX Lift (fixed base) + ground
-        # ------------------------------------------------------------------
+    
+    def _build_robot_model(self):
+        """Build the robot model with URDF and ground plane.
+        
+        Returns:
+            franka: ModelBuilder instance with robot loaded
+        """
         franka = newton.ModelBuilder()
         
         franka.add_urdf(
-            # lift2 urdf can be downloaded from https://gitee.pjlab.org.cn/L2/wanghui1/PulseAsset.git
             newton.examples.get_asset("lift2_urdf/fixed_robot.urdf"),
             floating=False,
             enable_self_collisions=False,
-            xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.17))
+            xform=wp.transform(p=wp.vec3(0.0, 0.0, self.ROBOT_BASE_HEIGHT))
         )
         franka.add_ground_plane()
-
-        # ------------------------------------------------------------------
-        # Set joint groups, print debug info
-        # ------------------------------------------------------------------
-        cnt = 0
-
-        # body information
+        
+        return franka
+    
+    def _identify_bodies_and_joints(self, builder):
+        """Identify end effectors and categorize joints into groups.
+        
+        Args:
+            builder: ModelBuilder instance
+        """
         print("=== Body Information ===")
-        for i in range(franka.body_count):
-            print(f"body {i}, key={franka.body_key[i]}")
-            # set left end effector
-            if franka.body_key[i] in left_ee_body_names:
+        for i in range(builder.body_count):
+            print(f"body {i}, key={builder.body_key[i]}")
+            if builder.body_key[i] in left_ee_body_names:
                 self.lee_index = i
                 print(f"  >> left end-effector")
-            # set right end effector
-            if franka.body_key[i] in right_ee_body_names:
+            if builder.body_key[i] in right_ee_body_names:
                 self.ree_index = i
                 print(f"  >> right end-effector")
 
-        # joint information
         print("=== Joint Information ===")
-        print(f"#joint_dof={franka.joint_dof_count}, #joint_coord = {franka.joint_coord_count}")
-        # joint groups
-        self.fixed_joint_indices = np.array([], dtype = int)
-        self.controllable_joint_indices = np.array([], dtype = int)
-        self.left_gripper_joint_indices = np.array([], dtype = int)
-        self.right_gripper_joint_indices = np.array([], dtype = int)
+        print(f"#joint_dof={builder.joint_dof_count}, #joint_coord={builder.joint_coord_count}")
+        
+        # Initialize joint group arrays
+        self.fixed_joint_indices = np.array([], dtype=int)
+        self.controllable_joint_indices = np.array([], dtype=int)
+        self.left_gripper_joint_indices = np.array([], dtype=int)
+        self.right_gripper_joint_indices = np.array([], dtype=int)
 
-        for i in range(franka.joint_count):
-            print(f"joint {i}, key={franka.joint_key[i]}, type={franka.joint_type[i]}, link={franka.joint_parent[i]} -> {franka.joint_child[i]}, dof_dim={franka.joint_dof_dim[i]}, dof_start {cnt}, dof_lim = [{franka.joint_limit_lower[cnt]}, {franka.joint_limit_upper[cnt]}]")
+        # Categorize joints
+        cnt = 0
+        for i in range(builder.joint_count):
+            dof_dim = builder.joint_dof_dim[i]
+            print(f"joint {i}, key={builder.joint_key[i]}, type={builder.joint_type[i]}, "
+                  f"link={builder.joint_parent[i]} -> {builder.joint_child[i]}, "
+                  f"dof_dim={dof_dim}, dof_start {cnt}, "
+                  f"dof_lim=[{builder.joint_limit_lower[cnt]}, {builder.joint_limit_upper[cnt]}]")
 
             dof_start = cnt
-            dof_end = cnt + franka.joint_dof_dim[i][0] + franka.joint_dof_dim[i][1]
-            # set fixed joint group
-            if franka.joint_key[i] in fixed_joint_names:
-                for j in range(dof_start, dof_end):
+            dof_end = cnt + dof_dim[0] + dof_dim[1]
+            
+            # Categorize joint based on name
+            for j in range(dof_start, dof_end):
+                if builder.joint_key[i] in fixed_joint_names:
                     self.fixed_joint_indices = np.append(self.fixed_joint_indices, [j])
-            # set controllable joint group
-            if franka.joint_key[i] in controllable_joint_names:
-                for j in range(dof_start, dof_end):
+                elif builder.joint_key[i] in controllable_joint_names:
                     self.controllable_joint_indices = np.append(self.controllable_joint_indices, [j])
-            # set left gripper joint group
-            if franka.joint_key[i] in left_gripper_joint_names:
-                for j in range(dof_start, dof_end):
+                elif builder.joint_key[i] in left_gripper_joint_names:
                     self.left_gripper_joint_indices = np.append(self.left_gripper_joint_indices, [j])
-            # set right gripper joint group
-            if franka.joint_key[i] in right_gripper_joint_names:
-                for j in range(dof_start, dof_end):
+                elif builder.joint_key[i] in right_gripper_joint_names:
                     self.right_gripper_joint_indices = np.append(self.right_gripper_joint_indices, [j])
 
-            cnt += franka.joint_dof_dim[i][0] + franka.joint_dof_dim[i][1]
+            cnt += dof_dim[0] + dof_dim[1]
 
-        print(f"joint dq cnt check: {cnt} == {franka.joint_dof_count}")
+        print(f"joint dq cnt check: {cnt} == {builder.joint_dof_count}")
         print("fixed joint", self.fixed_joint_indices)
         print("controllable joint", self.controllable_joint_indices)
         print("left joint", self.left_gripper_joint_indices)
         print("right joint", self.right_gripper_joint_indices)
-
-        if self.use_dump_joint:
-            self.joint_q_seq = np.empty((0, franka.joint_dof_count), dtype=np.float32)
-            self.openness_seq = np.empty((0, 2), dtype=np.float32)
-
-        # ------------------------------------------------------------------
-        # Configurate joints
-        # ------------------------------------------------------------------
-        self.robot_joint_q_cnt = len(franka.joint_q)
+    
+    def _configure_joint_controllers(self, builder):
+        """Configure control modes and gains for all joints.
         
-        # Configure target position control for arm joints.
+        Args:
+            builder: ModelBuilder instance
+        """
+        # Configure arm joints (target position control)
         for i in self.controllable_joint_indices:
-            franka.joint_dof_mode[i] = newton.JointMode.TARGET_POSITION
-            franka.joint_target_ke[i] = 3000.0200
-            franka.joint_target_kd[i] = 10.0
+            builder.joint_dof_mode[i] = newton.JointMode.TARGET_POSITION
+            builder.joint_target_ke[i] = self.ARM_JOINT_KE
+            builder.joint_target_kd[i] = self.ARM_JOINT_KD
 
-        # Remove control for the fixed joints
+        # Disable control for fixed joints
         for i in self.fixed_joint_indices:
-            franka.joint_dof_mode[i] = newton.JointMode.NONE
-            franka.joint_limit_lower[i] = 0
-            franka.joint_limit_upper[i] = 0
+            builder.joint_dof_mode[i] = newton.JointMode.NONE
+            builder.joint_limit_lower[i] = 0
+            builder.joint_limit_upper[i] = 0
 
-        # Configure control for the gripper
-        for i in np.concatenate((self.left_gripper_joint_indices, self.right_gripper_joint_indices)):
-            # Leave a small gap to avoid penetration
-            franka.joint_limit_lower[i] = 0.005
-            franka.joint_limit_upper[i] = 0.044
+        # Configure gripper joints
+        gripper_indices = np.concatenate((self.left_gripper_joint_indices, 
+                                          self.right_gripper_joint_indices))
+        for i in gripper_indices:
+            builder.joint_limit_lower[i] = self.GRIPPER_LIMIT_LOWER
+            builder.joint_limit_upper[i] = self.GRIPPER_LIMIT_UPPER
 
-            # Configure target control for gripper joints
             if self.gripper_control_type == GripperControlType.NONE:
-                franka.joint_dof_mode[i] = newton.JointMode.NONE
-
-            if self.gripper_control_type == GripperControlType.TARGET_POSITION:
-                franka.joint_dof_mode[i] = newton.JointMode.TARGET_POSITION
-                franka.joint_target_ke[i] = 3000.0
-                franka.joint_target_kd[i] = 10.0
-
-            if self.gripper_control_type == GripperControlType.TARGET_VELOCITY:
-                franka.joint_dof_mode[i] = newton.JointMode.TARGET_VELOCITY
-                franka.joint_target_kd[i] = 10.0
+                builder.joint_dof_mode[i] = newton.JointMode.NONE
+            elif self.gripper_control_type == GripperControlType.TARGET_POSITION:
+                builder.joint_dof_mode[i] = newton.JointMode.TARGET_POSITION
+                builder.joint_target_ke[i] = self.GRIPPER_JOINT_KE
+                builder.joint_target_kd[i] = self.GRIPPER_JOINT_KD
+            elif self.gripper_control_type == GripperControlType.TARGET_VELOCITY:
+                builder.joint_dof_mode[i] = newton.JointMode.TARGET_VELOCITY
+                builder.joint_target_kd[i] = self.GRIPPER_JOINT_KD
+    
+    def _add_scene_objects(self, builder):
+        """Add table, box, and cloth to the scene.
         
-        # ------------------------------------------------------------------
-        # Add other objects
-        # ------------------------------------------------------------------
+        Args:
+            builder: ModelBuilder instance
+        """
+        # Add fixed table
+        body_table = builder.add_body()
+        builder.add_joint_fixed(-1, body_table)
+        builder.add_shape_box(
+            body_table,
+            xform=wp.transform(p=self.TABLE_POS, q=wp.quat_identity()),
+            hx=self.TABLE_SIZE[0],
+            hy=self.TABLE_SIZE[1],
+            hz=self.TABLE_SIZE[2]
+        )
 
-        # Add a fixed table
-        pos = wp.vec3(1.0, 0.0, 0.201)
-        rot = wp.quat_identity()
-        body_table = franka.add_body()
-        franka.add_joint_fixed(-1, body_table)
-        franka.add_shape_box(body_table, xform=wp.transform(p=pos, q=rot), hx=0.6, hy=0.6, hz=0.2)
+        # # Add movable box
+        # body_box = builder.add_body(xform=wp.transform(p=self.BOX_POS, q=wp.quat_identity()))
+        # builder.add_joint_free(body_box)
+        # builder.add_shape_box(
+        #     body_box,
+        #     hx=self.BOX_SIZE,
+        #     hy=self.BOX_SIZE,
+        #     hz=self.BOX_SIZE,
+        #     cfg=newton.ModelBuilder.ShapeConfig(density=self.BOX_DENSITY)
+        # )
 
-        # Add a box
-        pos = wp.vec3(0.6, 0.0, 0.43)
-        rot = wp.quat_identity()
-        body_box = franka.add_body(xform=wp.transform(p=pos, q=rot))
-        franka.add_joint_free(body_box)
-        franka.add_shape_box(body_box, hx=0.03, hy=0.03, hz=0.03, cfg=newton.ModelBuilder.ShapeConfig(density=100.0))
+        # Set friction for all shapes
+        for i in range(len(builder.shape_material_mu)):
+            builder.shape_material_mu[i] = 1.0
+            builder.shape_material_ka[i] = 0.002
+            builder.shape_is_solid[i] = True
 
-        # Set friction
-        for i in range(len(franka.shape_material_mu)):
-            franka.shape_material_mu[i] = 1.0
-            franka.shape_material_ka[i] = 0.002
-            franka.shape_is_solid[i] = True
-
-        # Add the T-shirt (garment can be downloaded from https://gitee.pjlab.org.cn/L2/wanghui1/PulseAsset.git)
+        # Load and add cloth mesh
         usd_stage = Usd.Stage.Open(newton.examples.get_asset("PulseAsset/cloth/garment-tri.usdc"))
         usd_geom = UsdGeom.Mesh(usd_stage.GetPrimAtPath("/root/World/mesh/Mesh"))
         mesh_points = np.array(usd_geom.GetPointsAttr().Get())
         mesh_indices = np.array(usd_geom.GetFaceVertexIndicesAttr().Get())
         print("=== Cloth Information ===")
-        print(f"vertices = {mesh_points.shape}, faces = {mesh_indices.shape}")
+        print(f"vertices={mesh_points.shape}, faces={mesh_indices.shape}")
 
         vertices = [wp.vec3(v) for v in mesh_points]
-        franka.add_cloth_mesh(
+        builder.add_cloth_mesh(
             vertices=vertices,
             indices=mesh_indices,
-            rot=wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), np.pi*0.5),
-            pos=wp.vec3(0.7, 0.00, 0.5),
+            rot=wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), self.CLOTH_ROTATION_ANGLE),
+            pos=self.CLOTH_POS,
             vel=wp.vec3(0.0, 0.0, 0.0),
-            density=0.2,
-            scale=0.01,
+            density=self.CLOTH_DENSITY,
+            scale=self.CLOTH_SCALE,
             tri_ke=self.tri_ke,
             tri_ka=self.tri_ka,
             tri_kd=self.tri_kd,
@@ -590,28 +768,23 @@ class Example:
             edge_kd=self.bending_kd,
             particle_radius=self.cloth_particle_radius,
         )
-
-        franka.color()
-
-        # ------------------------------------------------------------------
-        # Finalization and initialization of computational components
-        # ------------------------------------------------------------------
-
-        # Finalize builder
-        self.model = franka.finalize(requires_grad=False)
-
-        # Precompute shape indices that belong to gripper finger bodies for contact filtering
+    
+    def _setup_contact_filtering(self):
+        """Setup contact filtering for gripper shapes."""
+        # Identify gripper body indices
         self.left_gripper_body_indices = []
         self.right_gripper_body_indices = []
         joint_child_np = self.model.joint_child.numpy()
+        
         for j_idx, j_key in enumerate(self.model.joint_key):
             if j_key in left_gripper_joint_names:
                 self.left_gripper_body_indices.append(int(joint_child_np[j_idx]))
             if j_key in right_gripper_joint_names:
                 self.right_gripper_body_indices.append(int(joint_child_np[j_idx]))
 
-        def _collect_shapes(body_indices: list[int]) -> set[int]:
-            shape_set: set[int] = set()
+        # Collect shapes for each gripper
+        def _collect_shapes(body_indices):
+            shape_set = set()
             for b in body_indices:
                 b_idx = int(b)
                 if b_idx in self.model.body_shapes:
@@ -622,90 +795,80 @@ class Example:
         self.left_gripper_shape_set = _collect_shapes(self.left_gripper_body_indices)
         self.right_gripper_shape_set = _collect_shapes(self.right_gripper_body_indices)
 
-        # GPU arrays for contact filtering (CUDA graph compatible)
-        max_disabled_shapes = len(self.left_gripper_shape_set) + len(self.right_gripper_shape_set)
-        self.disabled_shapes_wp = wp.zeros(max_disabled_shapes, dtype=int, device=self.model.device)
-        self.disabled_shape_count_wp = wp.zeros(1, dtype=int, device=self.model.device)
-        
-        # Pre-compute all possible disabled shape configurations for performance
-        # This avoids rebuilding arrays every frame
+        # Pre-compute disabled shape configurations
         left_shapes = sorted(list(self.left_gripper_shape_set))
         right_shapes = sorted(list(self.right_gripper_shape_set))
         both_shapes = left_shapes + right_shapes
         
         self._disabled_shapes_cache = {
-            (False, False): (np.array([], dtype=np.int32), 0),  # Neither gripper opening
-            (True, False): (np.array(left_shapes, dtype=np.int32), len(left_shapes)),  # Left only
-            (False, True): (np.array(right_shapes, dtype=np.int32), len(right_shapes)),  # Right only
-            (True, True): (np.array(both_shapes, dtype=np.int32), len(both_shapes)),  # Both opening
+            (False, False): (np.array([], dtype=np.int32), 0),
+            (True, False): (np.array(left_shapes, dtype=np.int32), len(left_shapes)),
+            (False, True): (np.array(right_shapes, dtype=np.int32), len(right_shapes)),
+            (True, True): (np.array(both_shapes, dtype=np.int32), len(both_shapes)),
         }
         
-        # Track previous state to avoid redundant updates
         self._prev_disabled_state = None
         
-        # Temporary buffers for filtering (reused each frame)
-        # soft_contact_max is not stored in Model, compute it as shape_count * particle_count
-        # This is the standard calculation used by collision pipelines
+        # Allocate GPU arrays for contact filtering
+        max_disabled_shapes = len(left_shapes) + len(right_shapes)
+        self.disabled_shapes_wp = wp.zeros(max_disabled_shapes, dtype=int, device=self.model.device)
+        self.disabled_shape_count_wp = wp.zeros(1, dtype=int, device=self.model.device)
+        
+        # Allocate temporary buffers for filtering
         soft_contact_max = self.model.shape_count * self.model.particle_count
         max_contacts = max(self.model.rigid_contact_max, soft_contact_max)
         self.keep_mask_wp = wp.zeros(max_contacts, dtype=int, device=self.model.device)
         self.prefix_sum_wp = wp.zeros(max_contacts, dtype=int, device=self.model.device)
         self.new_count_wp = wp.zeros(1, dtype=int, device=self.model.device)
-        
-        # Store soft_contact_max for later use in filtering kernels
         self.soft_contact_max = soft_contact_max
-
-        # Set cloth parameter
-        self.model.soft_contact_ke = self.soft_contact_ke
-        self.model.soft_contact_kd = self.soft_contact_kd
-        self.model.soft_contact_mu = self.self_contact_friction
-
-        # Warp compute graphs
-        self.ik_graph = None
-        self.physics_graph = None
-
-        # Device index buffers for grippers (for GPU kernels)
-        self.left_gripper_joint_indices_wp = wp.array(self.left_gripper_joint_indices, dtype=int, device=self.model.device)
-        self.right_gripper_joint_indices_wp = wp.array(self.right_gripper_joint_indices, dtype=int, device=self.model.device)
-        self.controllable_joint_indices_wp = wp.array(self.controllable_joint_indices, dtype=int, device=self.model.device)
+    
+    def _init_gpu_buffers(self):
+        """Initialize GPU buffers for control and IK."""
+        self.left_gripper_joint_indices_wp = wp.array(
+            self.left_gripper_joint_indices, dtype=int, device=self.model.device
+        )
+        self.right_gripper_joint_indices_wp = wp.array(
+            self.right_gripper_joint_indices, dtype=int, device=self.model.device
+        )
+        self.controllable_joint_indices_wp = wp.array(
+            self.controllable_joint_indices, dtype=int, device=self.model.device
+        )
         self.q0_frame_wp = wp.zeros(self.model.joint_coord_count, dtype=float, device=self.model.device)
         self.q_target_frame_wp = wp.zeros(self.model.joint_coord_count, dtype=float, device=self.model.device)
         self.gripper_params_wp = wp.zeros(4, dtype=float, device=self.model.device)
-
-        # Viewer
+    
+    def _setup_viewer(self):
+        """Configure viewer settings."""
         self.viewer.set_model(self.model)
         self.viewer.vsync = True
         if isinstance(self.viewer, newton.viewer.ViewerGL):
-            pos = type(self.viewer.camera.pos)(3.0, 0, 1.4)
-            self.viewer.camera.pos = pos
+            camera_pos = type(self.viewer.camera.pos)(3.0, 0, 1.4)
+            self.viewer.camera.pos = camera_pos
             self.viewer.camera.pitch = -20
-
-        # States
-        self.state = self.model.state() # for IKSolver
-        self.state_0 = self.model.state() # for Physics Solver
-        self.state_1 = self.model.state() # for Physics Solver
-        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state)
-        self.control = self.model.control() # for control
-
-        # ------------------------------------------------------------------
-        # End effector
-        # ------------------------------------------------------------------
+    
+    def _init_end_effector_control(self):
+        """Initialize end effector transforms and gripper states."""
+        # Initialize gripper openness
         self.open_left_gripper = 1.0
         self.open_right_gripper = 1.0
         self.left_gripper_state = 1.0
         self.right_gripper_state = 1.0
 
-        # Persistent gizmo transform (pass-by-ref mutated by viewer)
+        # Get initial end effector transforms
         body_q_np = self.state.body_q.numpy()
         initial_lee_tf = wp.transform(*body_q_np[self.lee_index])
         initial_ree_tf = wp.transform(*body_q_np[self.ree_index])
         
-        # Maximum displacement per frame to limit speed (for direct gizmo control)
-        self.max_displacement_per_frame = 0.003  # 5cm per frame at 60 FPS = 3 m/s max speed
-        self.max_rotation_per_frame = 0.03  # radians per frame 
-        # Store gizmo input values (updated by viewer in render())
-        # IMPORTANT: Create separate transform objects for gizmo to ensure they are independently mutable
-        # Use slice assignment to copy the transform values
+        # Statistics for debugging displacement limiting
+        self.clamp_stats = {
+            'pos_clamp_count': 0,
+            'rot_clamp_count': 0,
+            'total_frames': 0,
+            'max_pos_distance': 0.0,
+            'max_rot_angle': 0.0
+        }
+        
+        # Create independent transform objects for gizmo control
         self.gizmo_lee_tf = wp.transform(
             wp.transform_get_translation(initial_lee_tf),
             wp.transform_get_rotation(initial_lee_tf)
@@ -714,7 +877,8 @@ class Example:
             wp.transform_get_translation(initial_ree_tf),
             wp.transform_get_rotation(initial_ree_tf)
         )
-        # Store previous frame transforms for displacement limiting
+        
+        # Previous frame transforms for displacement limiting
         self.prev_gizmo_lee_tf = wp.transform(
             wp.transform_get_translation(initial_lee_tf),
             wp.transform_get_rotation(initial_lee_tf)
@@ -723,7 +887,8 @@ class Example:
             wp.transform_get_translation(initial_ree_tf),
             wp.transform_get_rotation(initial_ree_tf)
         )
-        # Store initial end effector transforms (used for IK objective initialization)
+        
+        # Initial end effector transforms for IK objectives
         self.lee_tf = wp.transform(
             wp.transform_get_translation(initial_lee_tf),
             wp.transform_get_rotation(initial_lee_tf)
@@ -732,35 +897,33 @@ class Example:
             wp.transform_get_translation(initial_ree_tf),
             wp.transform_get_rotation(initial_ree_tf)
         )
-
-        # INTERACTIVE_QUEUE mode: trajectory queue for 30-step execution
-        self.trajectory_queue_size = 10
-        # Pre-allocate queues to avoid memory allocation during runtime
-        # Each queue element is a wp.transform (7 floats: 3 pos + 4 quat)
+    
+    def _init_trajectory_queue(self):
+        """Initialize trajectory queue for INTERACTIVE_QUEUE mode."""
         self.lee_tf_queue = [wp.transform() for _ in range(self.trajectory_queue_size)]
         self.ree_tf_queue = [wp.transform() for _ in range(self.trajectory_queue_size)]
-        self.queue_executing = False  # Whether we are executing a queued trajectory
-        self.queue_index = 0  # Current index in the queue
-        # Cache current end effector targets to avoid GPU->CPU sync
-        self.cached_lee_target_tf = self.lee_tf  # Current left end effector target
-        self.cached_ree_target_tf = self.ree_tf  # Current right end effector target
-        # Pre-compute interpolation alphas for trajectory generation (optimization)
-        self.trajectory_alphas = np.linspace(1.0/self.trajectory_queue_size, 1.0, self.trajectory_queue_size, dtype=np.float32)
+        self.queue_index = 0
         
-        # Pre-allocate buffers for IK target updates to avoid repeated array creation
-        # These are reused every frame to minimize allocation overhead
-        self._ik_pos_buffer = np.zeros((1, 3), dtype=np.float32)
-        self._ik_rot_buffer = np.zeros((1, 4), dtype=np.float32)
-
-        # ------------------------------------------------------------------
-        # IK setup
-        # ------------------------------------------------------------------
+        # Cache targets to avoid GPU->CPU sync
+        self.cached_lee_target_tf = self.lee_tf
+        self.cached_ree_target_tf = self.ree_tf
+        
+        # Pre-compute interpolation alphas
+        self.trajectory_alphas = np.linspace(
+            1.0 / self.trajectory_queue_size,
+            1.0,
+            self.trajectory_queue_size,
+            dtype=np.float32
+        )
+    
+    def _setup_ik_objectives(self):
+        """Setup IK objectives for dual-arm control."""
         total_residuals = 2 * 6 + self.model.joint_coord_count
-
+        
         def _q2v4(q):
             return wp.vec4(q[0], q[1], q[2], q[3])
 
-        # Position objective
+        # Left end effector position objective
         self.l_pos_obj = ik.IKPositionObjective(
             link_index=self.lee_index,
             link_offset=wp.vec3(0.0, 0.0, 0.0),
@@ -770,7 +933,7 @@ class Example:
             residual_offset=0,
         )
 
-        # Rotation objective
+        # Left end effector rotation objective
         self.l_rot_obj = ik.IKRotationObjective(
             link_index=self.lee_index,
             link_offset_rotation=wp.quat_identity(),
@@ -780,7 +943,7 @@ class Example:
             residual_offset=3,
         )
 
-        # Position objective
+        # Right end effector position objective
         self.r_pos_obj = ik.IKPositionObjective(
             link_index=self.ree_index,
             link_offset=wp.vec3(0.0, 0.0, 0.0),
@@ -790,7 +953,7 @@ class Example:
             residual_offset=6,
         )
 
-        # Rotation objective
+        # Right end effector rotation objective
         self.r_rot_obj = ik.IKRotationObjective(
             link_index=self.ree_index,
             link_offset_rotation=wp.quat_identity(),
@@ -809,26 +972,20 @@ class Example:
             residual_offset=12,
             weight=10.0,
         )
-
-        # Variables the solver will update
-        self.ik_joint_q = wp.array(self.model.joint_q, shape=(1, self.model.joint_coord_count))
-        self.ik_joint_qd = wp.array(self.model.joint_qd, shape=(self.model.joint_dof_count))
-        self.ik_iters = 24
-
-        # trajectory animation
-        # TODO: better API
-        self.trajectory_animation = KeyFrameTrajectoryAnimation()
-        self.trajectory_animation.init_lift2_folding()
-
-        # ------------------------------------------------------------------
-        # Solvers
-        # ------------------------------------------------------------------
-
+    
+    def _init_solvers(self):
+        """Initialize IK, rigid body, and cloth solvers."""
         # IK solver
         self.solver = ik.IKSolver(
             model=self.model,
             joint_q=self.ik_joint_q,
-            objectives=[self.l_pos_obj, self.l_rot_obj, self.r_pos_obj, self.r_rot_obj, self.obj_joint_limits],
+            objectives=[
+                self.l_pos_obj,
+                self.l_rot_obj,
+                self.r_pos_obj,
+                self.r_rot_obj,
+                self.obj_joint_limits
+            ],
             lambda_initial=0.1,
             jacobian_mode=ik.IKJacobianMode.MIXED,
         )
@@ -858,7 +1015,10 @@ class Example:
             integrate_with_external_rigid_solver=True,
             collision_detection_interval=-1,
         )
-        self.capture()
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Main Simulation Methods
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def capture(self):
         """Capture IK and physics simulation into CUDA graphs for better performance."""
@@ -944,12 +1104,16 @@ class Example:
 
     def _push_targets_from_gizmos(self):
         """Read gizmo-updated transform and push into IK objectives with displacement limiting."""
+        # Enable debug output every 30 frames to avoid flooding
+        debug_enabled = (self.sim_frame % 30 == 0)
+        
         # Clamp left end effector displacement
         clamped_lee_tf = clamp_transform_delta(
             self.prev_gizmo_lee_tf, 
             self.gizmo_lee_tf, 
             self.max_displacement_per_frame, 
-            self.max_rotation_per_frame
+            self.max_rotation_per_frame,
+            stats_dict=self.clamp_stats
         )
         
         # Clamp right end effector displacement
@@ -957,8 +1121,19 @@ class Example:
             self.prev_gizmo_ree_tf, 
             self.gizmo_ree_tf, 
             self.max_displacement_per_frame, 
-            self.max_rotation_per_frame
+            self.max_rotation_per_frame,
+            stats_dict=self.clamp_stats
         )
+        
+        # Print statistics every 30 frames
+        if debug_enabled and self.clamp_stats['total_frames'] > 0:
+            pos_clamp_pct = 100.0 * self.clamp_stats['pos_clamp_count'] / self.clamp_stats['total_frames']
+            rot_clamp_pct = 100.0 * self.clamp_stats['rot_clamp_count'] / self.clamp_stats['total_frames']
+            print(f"[STATS] Clamp Statistics (Frame {self.sim_frame}):")
+            print(f"  Position clamps: {self.clamp_stats['pos_clamp_count']}/{self.clamp_stats['total_frames']} ({pos_clamp_pct:.1f}%)")
+            print(f"  Rotation clamps: {self.clamp_stats['rot_clamp_count']}/{self.clamp_stats['total_frames']} ({rot_clamp_pct:.1f}%)")
+            print(f"  Max pos distance: {self.clamp_stats['max_pos_distance']*1000:.2f}mm")
+            print(f"  Max rot angle: {np.degrees(self.clamp_stats['max_rot_angle']):.2f}°")
         
         # Set IK targets with clamped transforms (optimized: direct array assignment)
         lee_pos = wp.transform_get_translation(clamped_lee_tf)
@@ -988,6 +1163,14 @@ class Example:
         self._ik_rot_buffer[0, 2] = ree_rot[2]
         self._ik_rot_buffer[0, 3] = ree_rot[3]
         self.r_rot_obj.target_rotations.assign(self._ik_rot_buffer)
+        
+        # CRITICAL FIX: Update gizmo transforms to clamped values
+        # This prevents the "chasing" problem where the robot can never catch up
+        # to a distant gizmo target. By updating gizmo to the clamped position,
+        # the next frame will continue from this position rather than trying to
+        # reach the original far-away target.
+        self.gizmo_lee_tf = clamped_lee_tf
+        self.gizmo_ree_tf = clamped_ree_tf
         
         # Update previous transforms for next frame
         self.prev_gizmo_lee_tf = clamped_lee_tf
@@ -1034,7 +1217,7 @@ class Example:
         
         return wp.transform(pos_interp, rot_interp)
 
-    def _has_gizmo_moved(self, threshold_pos=0.001, threshold_rot=0.01):
+    def _has_gizmo_moved(self, threshold_pos=0.001, threshold_rot=0.1):
         """Check if gizmo has moved significantly since last recorded position."""
         # Check left end effector
         lee_pos_curr = wp.transform_get_translation(self.gizmo_lee_tf)
@@ -1061,41 +1244,45 @@ class Example:
                 ree_pos_diff > threshold_pos or ree_rot_diff > threshold_rot)
 
     def _push_targets_from_gizmos_queue(self):
-        """Read gizmo-updated transform and create a 30-step trajectory queue.
+        """Read gizmo-updated transform and create a trajectory queue when gizmo moves.
         
         This method allows continuous gizmo input and creates smooth interpolated trajectories:
         - Always reads gizmo input from viewer
-        - When gizmo moves significantly, creates a new 30-step trajectory for end effectors
+        - Only when gizmo moves significantly, regenerates trajectory
         - Gripper openness is applied immediately without queueing
         - Executes one step from the queue per frame
-        - Allows user to interrupt and create new trajectories at any time
         """
         # Handle gripper control via keyboard (immediate response, no queue)
         if hasattr(self.viewer, "is_key_down"):
             if self.viewer.is_key_down("1"):
-                self.open_left_gripper -= 0.1
+                self.open_left_gripper -= 0.05
             else:
-                self.open_left_gripper += 0.1
+                self.open_left_gripper += 0.05
 
             if self.viewer.is_key_down("2"):
-                self.open_right_gripper -= 0.1
+                self.open_right_gripper -= 0.05
             else:
-                self.open_right_gripper += 0.1
+                self.open_right_gripper += 0.05
                 
             self.open_left_gripper = np.clip(self.open_left_gripper, 0.0, 1.0)
             self.open_right_gripper = np.clip(self.open_right_gripper, 0.0, 1.0)
         
         # Check if gizmo has moved significantly
-        gizmo_moved = self._has_gizmo_moved()
-        
-        # Create new trajectory if gizmo moved or if not currently executing
-        if gizmo_moved or not self.queue_executing:
+        gizmo_moved = self._has_gizmo_moved(threshold_pos=0.001)
+        if gizmo_moved:
+            print(f"Gizmo moved: {gizmo_moved}!!!!")
+
+        if gizmo_moved:
+            # Enable debug output every 30 frames to avoid flooding
+            # debug_enabled = (self.sim_frame % 2 == 0)
+            
             # Clamp left end effector displacement
             clamped_lee_tf = clamp_transform_delta(
                 self.prev_gizmo_lee_tf, 
                 self.gizmo_lee_tf, 
                 self.max_displacement_per_frame * self.trajectory_queue_size,  # Scale for total movement
-                self.max_rotation_per_frame * self.trajectory_queue_size
+                self.max_rotation_per_frame * self.trajectory_queue_size,
+                stats_dict=self.clamp_stats
             )
             
             # Clamp right end effector displacement
@@ -1103,8 +1290,19 @@ class Example:
                 self.prev_gizmo_ree_tf, 
                 self.gizmo_ree_tf, 
                 self.max_displacement_per_frame * self.trajectory_queue_size,
-                self.max_rotation_per_frame * self.trajectory_queue_size
+                self.max_rotation_per_frame * self.trajectory_queue_size,
+                stats_dict=self.clamp_stats
             )
+            
+            # Print statistics every 30 frames
+            # if debug_enabled and self.clamp_stats['total_frames'] > 0:
+            #     pos_clamp_pct = 100.0 * self.clamp_stats['pos_clamp_count'] / self.clamp_stats['total_frames']
+            #     rot_clamp_pct = 100.0 * self.clamp_stats['rot_clamp_count'] / self.clamp_stats['total_frames']
+            #     print(f"[STATS] Clamp Statistics (Frame {self.sim_frame}):")
+            #     print(f"  Position clamps: {self.clamp_stats['pos_clamp_count']}/{self.clamp_stats['total_frames']} ({pos_clamp_pct:.1f}%)")
+            #     print(f"  Rotation clamps: {self.clamp_stats['rot_clamp_count']}/{self.clamp_stats['total_frames']} ({rot_clamp_pct:.1f}%)")
+            #     print(f"  Max pos distance: {self.clamp_stats['max_pos_distance']*1000:.2f}mm")
+            #     print(f"  Max rot angle: {np.degrees(self.clamp_stats['max_rot_angle']):.2f}°")
             
             # Use cached target transforms to avoid GPU->CPU sync
             # These represent the last target we set for IK, avoiding expensive .numpy() call
@@ -1138,15 +1336,26 @@ class Example:
             
             # Start executing the new queue
             self.queue_executing = True
-            self.queue_index = 0
+            self.queue_index = 0  # Restart from beginning
             
-            # Update previous transforms
-            self.prev_gizmo_lee_tf = clamped_lee_tf
-            self.prev_gizmo_ree_tf = clamped_ree_tf
-            
-            # Skip debug print for better GPU performance
-            # if gizmo_moved:
-            #     print(f"Gizmo moved! Creating new trajectory with {self.trajectory_queue_size} steps")
+            # NOTE: We don't update self.gizmo_lee_tf here because:
+            # 1. Viewer holds a reference to the gizmo transform object
+            # 2. Replacing the reference would break the viewer's connection
+            # 3. The gizmo represents user input, not robot state
+            # 4. The clamping is applied to the trajectory, not the gizmo display
+        
+        # IMPORTANT: Always update previous transforms at the end of each frame
+        # This must be done regardless of whether gizmo moved or not, otherwise
+        # we can't detect movement in the next frame
+        # NOTE: Must create NEW transform objects, not just copy references!
+        self.prev_gizmo_lee_tf = wp.transform(
+            wp.transform_get_translation(self.gizmo_lee_tf),
+            wp.transform_get_rotation(self.gizmo_lee_tf)
+        )
+        self.prev_gizmo_ree_tf = wp.transform(
+            wp.transform_get_translation(self.gizmo_ree_tf),
+            wp.transform_get_rotation(self.gizmo_ree_tf)
+        )
         
         # Execute current step in the queue (only for end effectors)
         if self.queue_executing and self.queue_index < len(self.lee_tf_queue):
@@ -1191,6 +1400,143 @@ class Example:
             self.cached_lee_target_tf = target_lee_tf
             self.cached_ree_target_tf = target_ree_tf
             
+            # IMPORTANT: Update gizmo positions to match queue execution
+            # This makes the gizmo follow the smooth interpolated trajectory
+            # Note: We create new transform objects here, which is fine because
+            # the viewer re-fetches the gizmo reference on each render() call
+            self.gizmo_lee_tf = wp.transform(lee_pos, lee_rot)
+            self.gizmo_ree_tf = wp.transform(ree_pos, ree_rot)
+            
+            # Advance queue index
+            self.queue_index += 1
+            
+            # Check if queue is finished
+            if self.queue_index >= len(self.lee_tf_queue):
+                self.queue_executing = False
+                self.queue_index = 0
+
+    def _push_targets_from_gizmos_queue_no_clamp(self):
+        """Read gizmo-updated transform and create a trajectory queue without clamping.
+        
+        This method is similar to _push_targets_from_gizmos_queue but does not apply
+        displacement or rotation limits, allowing larger movements per frame.
+        
+        Key differences from INTERACTIVE_QUEUE:
+        - No clamping of displacement or rotation
+        - Allows fast, long-distance movements
+        - Still provides smooth interpolation via queue
+        """
+        # Handle gripper control via keyboard (immediate response, no queue)
+        if hasattr(self.viewer, "is_key_down"):
+            if self.viewer.is_key_down("1"):
+                self.open_left_gripper -= 0.05
+            else:
+                self.open_left_gripper += 0.05
+
+            if self.viewer.is_key_down("2"):
+                self.open_right_gripper -= 0.05
+            else:
+                self.open_right_gripper += 0.05
+                
+            self.open_left_gripper = np.clip(self.open_left_gripper, 0.0, 1.0)
+            self.open_right_gripper = np.clip(self.open_right_gripper, 0.0, 1.0)
+        
+        # Check if gizmo has moved significantly
+        gizmo_moved = self._has_gizmo_moved(threshold_pos=0.001)
+        if gizmo_moved:
+            print(f"Gizmo moved (no clamp mode): {gizmo_moved}!!!!")
+
+        if gizmo_moved:
+            # Use gizmo positions directly without clamping
+            target_lee_tf = self.gizmo_lee_tf
+            target_ree_tf = self.gizmo_ree_tf
+            
+            # Use cached target transforms to avoid GPU->CPU sync
+            current_lee_tf = self.cached_lee_target_tf
+            current_ree_tf = self.cached_ree_target_tf
+            
+            # Fill pre-allocated trajectory queues by interpolating from current to target
+            # No clamping applied - full range movement allowed
+            lee_pos_start = wp.transform_get_translation(current_lee_tf)
+            lee_pos_end = wp.transform_get_translation(target_lee_tf)
+            lee_rot_start = wp.transform_get_rotation(current_lee_tf)
+            lee_rot_end = wp.transform_get_rotation(target_lee_tf)
+            
+            ree_pos_start = wp.transform_get_translation(current_ree_tf)
+            ree_pos_end = wp.transform_get_translation(target_ree_tf)
+            ree_rot_start = wp.transform_get_rotation(current_ree_tf)
+            ree_rot_end = wp.transform_get_rotation(target_ree_tf)
+            
+            for i, alpha in enumerate(self.trajectory_alphas):
+                # Left end effector interpolation (inlined for performance)
+                alpha_f = float(alpha)
+                lee_pos_interp = lee_pos_start + alpha_f * (lee_pos_end - lee_pos_start)
+                lee_rot_interp = wp.quat_slerp(lee_rot_start, lee_rot_end, alpha_f)
+                self.lee_tf_queue[i] = wp.transform(lee_pos_interp, lee_rot_interp)
+                
+                # Right end effector interpolation (inlined for performance)
+                ree_pos_interp = ree_pos_start + alpha_f * (ree_pos_end - ree_pos_start)
+                ree_rot_interp = wp.quat_slerp(ree_rot_start, ree_rot_end, alpha_f)
+                self.ree_tf_queue[i] = wp.transform(ree_pos_interp, ree_rot_interp)
+            
+            # Start executing the new queue
+            self.queue_executing = True
+            self.queue_index = 0  # Restart from beginning
+        
+        # IMPORTANT: Always update previous transforms at the end of each frame
+        self.prev_gizmo_lee_tf = wp.transform(
+            wp.transform_get_translation(self.gizmo_lee_tf),
+            wp.transform_get_rotation(self.gizmo_lee_tf)
+        )
+        self.prev_gizmo_ree_tf = wp.transform(
+            wp.transform_get_translation(self.gizmo_ree_tf),
+            wp.transform_get_rotation(self.gizmo_ree_tf)
+        )
+        
+        # Execute current step in the queue (same as INTERACTIVE_QUEUE)
+        if self.queue_executing and self.queue_index < len(self.lee_tf_queue):
+            # Get current target from queue
+            target_lee_tf = self.lee_tf_queue[self.queue_index]
+            target_ree_tf = self.ree_tf_queue[self.queue_index]
+            
+            # Direct GPU array assignment
+            lee_pos = wp.transform_get_translation(target_lee_tf)
+            lee_rot = wp.transform_get_rotation(target_lee_tf)
+            ree_pos = wp.transform_get_translation(target_ree_tf)
+            ree_rot = wp.transform_get_rotation(target_ree_tf)
+            
+            # Left end effector
+            self._ik_pos_buffer[0, 0] = lee_pos[0]
+            self._ik_pos_buffer[0, 1] = lee_pos[1]
+            self._ik_pos_buffer[0, 2] = lee_pos[2]
+            self.l_pos_obj.target_positions.assign(self._ik_pos_buffer)
+            
+            self._ik_rot_buffer[0, 0] = lee_rot[0]
+            self._ik_rot_buffer[0, 1] = lee_rot[1]
+            self._ik_rot_buffer[0, 2] = lee_rot[2]
+            self._ik_rot_buffer[0, 3] = lee_rot[3]
+            self.l_rot_obj.target_rotations.assign(self._ik_rot_buffer)
+            
+            # Right end effector
+            self._ik_pos_buffer[0, 0] = ree_pos[0]
+            self._ik_pos_buffer[0, 1] = ree_pos[1]
+            self._ik_pos_buffer[0, 2] = ree_pos[2]
+            self.r_pos_obj.target_positions.assign(self._ik_pos_buffer)
+            
+            self._ik_rot_buffer[0, 0] = ree_rot[0]
+            self._ik_rot_buffer[0, 1] = ree_rot[1]
+            self._ik_rot_buffer[0, 2] = ree_rot[2]
+            self._ik_rot_buffer[0, 3] = ree_rot[3]
+            self.r_rot_obj.target_rotations.assign(self._ik_rot_buffer)
+            
+            # Update cached targets
+            self.cached_lee_target_tf = target_lee_tf
+            self.cached_ree_target_tf = target_ree_tf
+            
+            # Update gizmo positions to match queue execution
+            self.gizmo_lee_tf = wp.transform(lee_pos, lee_rot)
+            self.gizmo_ree_tf = wp.transform(ree_pos, ree_rot)
+            
             # Advance queue index
             self.queue_index += 1
             
@@ -1226,12 +1572,16 @@ class Example:
             self.open_left_gripper = np.clip(self.open_left_gripper, 0.0, 1.0)
             self.open_right_gripper = np.clip(self.open_right_gripper, 0.0, 1.0)
         
+        # Enable debug output every 30 frames to avoid flooding
+        debug_enabled = (self.sim_frame % 30 == 0)
+        
         # Clamp left end effector displacement
         clamped_lee_tf = clamp_transform_delta(
             self.prev_gizmo_lee_tf, 
             self.gizmo_lee_tf, 
             self.max_displacement_per_frame, 
-            self.max_rotation_per_frame
+            self.max_rotation_per_frame,
+            stats_dict=self.clamp_stats
         )
         
         # Clamp right end effector displacement
@@ -1239,8 +1589,19 @@ class Example:
             self.prev_gizmo_ree_tf, 
             self.gizmo_ree_tf, 
             self.max_displacement_per_frame, 
-            self.max_rotation_per_frame
+            self.max_rotation_per_frame,
+            stats_dict=self.clamp_stats
         )
+        
+        # Print statistics every 30 frames
+        if debug_enabled and self.clamp_stats['total_frames'] > 0:
+            pos_clamp_pct = 100.0 * self.clamp_stats['pos_clamp_count'] / self.clamp_stats['total_frames']
+            rot_clamp_pct = 100.0 * self.clamp_stats['rot_clamp_count'] / self.clamp_stats['total_frames']
+            print(f"[STATS] Clamp Statistics (Frame {self.sim_frame}):")
+            print(f"  Position clamps: {self.clamp_stats['pos_clamp_count']}/{self.clamp_stats['total_frames']} ({pos_clamp_pct:.1f}%)")
+            print(f"  Rotation clamps: {self.clamp_stats['rot_clamp_count']}/{self.clamp_stats['total_frames']} ({rot_clamp_pct:.1f}%)")
+            print(f"  Max pos distance: {self.clamp_stats['max_pos_distance']*1000:.2f}mm")
+            print(f"  Max rot angle: {np.degrees(self.clamp_stats['max_rot_angle']):.2f}°")
         
         # Extract transform components
         lee_pos = wp.transform_get_translation(clamped_lee_tf)
@@ -1273,6 +1634,14 @@ class Example:
         self._ik_rot_buffer[0, 2] = ree_rot[2]
         self._ik_rot_buffer[0, 3] = ree_rot[3]
         self.r_rot_obj.target_rotations.assign(self._ik_rot_buffer)
+        
+        # CRITICAL FIX: Update gizmo transforms to clamped values
+        # This prevents the "chasing" problem where the robot can never catch up
+        # to a distant gizmo target. By updating gizmo to the clamped position,
+        # the next frame will continue from this position rather than trying to
+        # reach the original far-away target.
+        self.gizmo_lee_tf = clamped_lee_tf
+        self.gizmo_ree_tf = clamped_ree_tf
         
         # Update previous transforms for next frame
         self.prev_gizmo_lee_tf = clamped_lee_tf
@@ -1538,8 +1907,8 @@ class Example:
             self.left_gripper_state = self.open_left_gripper
             self.right_gripper_state = self.open_right_gripper
 
-        # Avoid print in INTERACTIVE_QUEUE and INTERACTIVE_NO_QUEUE modes for better GPU performance
-        if self.animation_type not in (AnimationType.INTERACTIVE_QUEUE, AnimationType.INTERACTIVE_NO_QUEUE):
+        # Avoid print in INTERACTIVE_QUEUE, INTERACTIVE_NO_QUEUE, and QUEUE_NO_CLAMP modes for better GPU performance
+        if self.animation_type not in (AnimationType.INTERACTIVE_QUEUE, AnimationType.INTERACTIVE_NO_QUEUE, AnimationType.QUEUE_NO_CLAMP):
             print('Step time:', self.sim_time)
 
         if self.animation_type == AnimationType.INTERACTIVE:
@@ -1550,6 +1919,9 @@ class Example:
 
         if self.animation_type == AnimationType.INTERACTIVE_NO_QUEUE:
             self._push_targets_from_gizmos_no_queue()
+
+        if self.animation_type == AnimationType.QUEUE_NO_CLAMP:
+            self._push_targets_from_gizmos_queue_no_clamp()
 
         if self.animation_type == AnimationType.TRAJECTORY:
             self._push_targets_from_trajectories()
@@ -1599,7 +1971,7 @@ class Example:
             step_duration = current_time - self.last_step_time
             current_fps = 1.0 / step_duration if step_duration > 0 else 0            
             # Print FPS info (skip frequent printing in GPU-optimized interactive modes for better performance)
-            if self.animation_type not in (AnimationType.INTERACTIVE_QUEUE, AnimationType.INTERACTIVE_NO_QUEUE) or self.sim_frame % 30 == 0:
+            if self.animation_type not in (AnimationType.INTERACTIVE_QUEUE, AnimationType.INTERACTIVE_NO_QUEUE, AnimationType.QUEUE_NO_CLAMP) or self.sim_frame % 30 == 0:
                 print(f'Frame {self.sim_frame}: FPS = {current_fps:.2f}, Step time = {step_duration*1000:.2f}ms')
         
         self.last_step_time = current_time
@@ -1639,14 +2011,20 @@ class Example:
             self.viewer.log_gizmo("left_target_tcp", self.gizmo_lee_tf)
             self.viewer.log_gizmo("right_target_tcp", self.gizmo_ree_tf)
         
+        if self.animation_type == AnimationType.QUEUE_NO_CLAMP:
+            # Register gizmo for QUEUE_NO_CLAMP mode
+            # Queue-based control without displacement clamping
+            self.viewer.log_gizmo("left_target_tcp", self.gizmo_lee_tf)
+            self.viewer.log_gizmo("right_target_tcp", self.gizmo_ree_tf)
+        
         self.viewer.log_state(self.state_0)
 
         self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
 
         # Only synchronize for non-GPU-optimized modes
-        # For INTERACTIVE_QUEUE and INTERACTIVE_NO_QUEUE, rely on implicit synchronization at render time
-        if self.animation_type not in (AnimationType.INTERACTIVE_QUEUE, AnimationType.INTERACTIVE_NO_QUEUE):
+        # For INTERACTIVE_QUEUE, INTERACTIVE_NO_QUEUE, and QUEUE_NO_CLAMP, rely on implicit synchronization at render time
+        if self.animation_type not in (AnimationType.INTERACTIVE_QUEUE, AnimationType.INTERACTIVE_NO_QUEUE, AnimationType.QUEUE_NO_CLAMP):
             wp.synchronize()
 
         if self.use_dump_image:
@@ -1660,7 +2038,39 @@ if __name__ == "__main__":
     parser = newton.examples.create_parser()
     if not os.environ.get("DISPLAY"):
         parser.set_defaults(viewer="null", headless=True)
+    
+    # Add custom arguments for control configuration
+    parser.add_argument("--gripper-control-type", type=int, default=1,
+                        choices=[0, 1, 2],
+                        help="Gripper control: 0=NONE, 1=TARGET_POSITION, 2=TARGET_VELOCITY")
+    
+    parser.add_argument("--animation-type", type=int, default=4,
+                        choices=[0, 1, 2, 3, 4],
+                        help="Animation: 0=INTERACTIVE, 1=TRAJECTORY, 2=INTERACTIVE_QUEUE, 3=INTERACTIVE_NO_QUEUE, 4=QUEUE_NO_CLAMP")
+    
+    parser.add_argument("--vbd-iterations", type=int, default=7,
+                        help="VBD iterations for cloth simulation")
+    
+    parser.add_argument("--use-mujoco-cpu", action="store_true", default=False,
+                        help="Use MuJoCo CPU solver instead of GPU")
+    
+    parser.add_argument("--trajectory-queue-size", type=int, default=30,
+                        help="Trajectory queue size for INTERACTIVE_QUEUE mode")
+    
+    # Simulation timing parameters
+    parser.add_argument("--fps", type=int, default=30,
+                        help="Simulation FPS (frames per second)")
+    
+    parser.add_argument("--sim-substeps", type=int, default=20,
+                        help="Simulation substeps per frame")
+    
+    # Motion limits for gizmo control
+    parser.add_argument("--max-displacement-per-frame", type=float, default=0.1,
+                        help="Maximum displacement per frame in meters (e.g., 0.01 = 10mm)")
+    
+    parser.add_argument("--max-rotation-per-frame", type=float, default=0.1,
+                        help="Maximum rotation per frame in radians (e.g., 0.1 ≈ 5.7°)")
 
     viewer, args = newton.examples.init(parser)
-    example = Example(viewer)
+    example = Example(viewer, args)
     newton.examples.run(example, args)
