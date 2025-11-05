@@ -255,11 +255,6 @@ class Example:
         self.trajectory_queue_size = args.trajectory_queue_size
         self.queue_executing = False
         
-        # Motion limits for gizmo control
-        self.max_displacement_per_frame = args.max_displacement_per_frame
-        self.max_rotation_per_frame = args.max_rotation_per_frame
-        print(f"Motion limits: displacement={self.max_displacement_per_frame*1000:.1f}mm/frame, rotation={np.degrees(self.max_rotation_per_frame):.1f}°/frame")
-        
         self.use_dump_image = False
         self.use_dump_joint = False
         
@@ -302,11 +297,6 @@ class Example:
         # 8. Finalize Model and Initialize Computational Components
         # ═══════════════════════════════════════════════════════════════════════════
         self.model = franka.finalize(requires_grad=False)
-
-        # ═══════════════════════════════════════════════════════════════════════════
-        # 9. Setup Contact Filtering for Gripper
-        # ═══════════════════════════════════════════════════════════════════════════
-        self._setup_contact_filtering()
         
         # Apply cloth parameters to model
         self.model.soft_contact_ke = self.soft_contact_ke
@@ -563,59 +553,6 @@ class Example:
             edge_kd=self.bending_kd,
             particle_radius=self.cloth_particle_radius,
         )
-    
-    def _setup_contact_filtering(self):
-        """Setup contact filtering for gripper shapes."""
-        # Identify gripper body indices
-        self.left_gripper_body_indices = []
-        self.right_gripper_body_indices = []
-        joint_child_np = self.model.joint_child.numpy()
-        
-        for j_idx, j_key in enumerate(self.model.joint_key):
-            if j_key in left_gripper_joint_names:
-                self.left_gripper_body_indices.append(int(joint_child_np[j_idx]))
-            if j_key in right_gripper_joint_names:
-                self.right_gripper_body_indices.append(int(joint_child_np[j_idx]))
-
-        # Collect shapes for each gripper
-        def _collect_shapes(body_indices):
-            shape_set = set()
-            for b in body_indices:
-                b_idx = int(b)
-                if b_idx in self.model.body_shapes:
-                    for s in self.model.body_shapes[b_idx]:
-                        shape_set.add(int(s))
-            return shape_set
-
-        self.left_gripper_shape_set = _collect_shapes(self.left_gripper_body_indices)
-        self.right_gripper_shape_set = _collect_shapes(self.right_gripper_body_indices)
-
-        # Pre-compute disabled shape configurations
-        left_shapes = sorted(list(self.left_gripper_shape_set))
-        right_shapes = sorted(list(self.right_gripper_shape_set))
-        both_shapes = left_shapes + right_shapes
-        
-        self._disabled_shapes_cache = {
-            (False, False): (np.array([], dtype=np.int32), 0),
-            (True, False): (np.array(left_shapes, dtype=np.int32), len(left_shapes)),
-            (False, True): (np.array(right_shapes, dtype=np.int32), len(right_shapes)),
-            (True, True): (np.array(both_shapes, dtype=np.int32), len(both_shapes)),
-        }
-        
-        self._prev_disabled_state = None
-        
-        # Allocate GPU arrays for contact filtering
-        max_disabled_shapes = len(left_shapes) + len(right_shapes)
-        self.disabled_shapes_wp = wp.zeros(max_disabled_shapes, dtype=int, device=self.model.device)
-        self.disabled_shape_count_wp = wp.zeros(1, dtype=int, device=self.model.device)
-        
-        # Allocate temporary buffers for filtering
-        soft_contact_max = self.model.shape_count * self.model.particle_count
-        max_contacts = max(self.model.rigid_contact_max, soft_contact_max)
-        self.keep_mask_wp = wp.zeros(max_contacts, dtype=int, device=self.model.device)
-        self.prefix_sum_wp = wp.zeros(max_contacts, dtype=int, device=self.model.device)
-        self.new_count_wp = wp.zeros(1, dtype=int, device=self.model.device)
-        self.soft_contact_max = soft_contact_max
     
     def _init_gpu_buffers(self):
         """Initialize GPU buffers for control and IK."""
@@ -894,100 +831,6 @@ class Example:
 
             # Swap state
             (self.state_0, self.state_1) = (self.state_1, self.state_0)
-
-    def _push_targets_from_gizmos(self):
-        """Read gizmo-updated transform and push into IK objectives with displacement limiting."""
-        # Enable debug output every 30 frames to avoid flooding
-        debug_enabled = (self.sim_frame % 30 == 0)
-        
-        # Clamp left end effector displacement
-        clamped_lee_tf = clamp_transform_delta(
-            self.prev_gizmo_lee_tf, 
-            self.gizmo_lee_tf, 
-            self.max_displacement_per_frame, 
-            self.max_rotation_per_frame,
-            stats_dict=self.clamp_stats
-        )
-        
-        # Clamp right end effector displacement
-        clamped_ree_tf = clamp_transform_delta(
-            self.prev_gizmo_ree_tf, 
-            self.gizmo_ree_tf, 
-            self.max_displacement_per_frame, 
-            self.max_rotation_per_frame,
-            stats_dict=self.clamp_stats
-        )
-        
-        # Print statistics every 30 frames
-        if debug_enabled and self.clamp_stats['total_frames'] > 0:
-            pos_clamp_pct = 100.0 * self.clamp_stats['pos_clamp_count'] / self.clamp_stats['total_frames']
-            rot_clamp_pct = 100.0 * self.clamp_stats['rot_clamp_count'] / self.clamp_stats['total_frames']
-            print(f"[STATS] Clamp Statistics (Frame {self.sim_frame}):")
-            print(f"  Position clamps: {self.clamp_stats['pos_clamp_count']}/{self.clamp_stats['total_frames']} ({pos_clamp_pct:.1f}%)")
-            print(f"  Rotation clamps: {self.clamp_stats['rot_clamp_count']}/{self.clamp_stats['total_frames']} ({rot_clamp_pct:.1f}%)")
-            print(f"  Max pos distance: {self.clamp_stats['max_pos_distance']*1000:.2f}mm")
-            print(f"  Max rot angle: {np.degrees(self.clamp_stats['max_rot_angle']):.2f}°")
-        
-        # Set IK targets with clamped transforms (optimized: direct array assignment)
-        lee_pos = wp.transform_get_translation(clamped_lee_tf)
-        lee_rot = wp.transform_get_rotation(clamped_lee_tf)
-        ree_pos = wp.transform_get_translation(clamped_ree_tf)
-        ree_rot = wp.transform_get_rotation(clamped_ree_tf)
-        
-        # Use pre-allocated buffers to avoid array creation and kernel launch overhead
-        self._ik_pos_buffer[0, 0] = lee_pos[0]
-        self._ik_pos_buffer[0, 1] = lee_pos[1]
-        self._ik_pos_buffer[0, 2] = lee_pos[2]
-        self.l_pos_obj.target_positions.assign(self._ik_pos_buffer)
-        
-        self._ik_rot_buffer[0, 0] = lee_rot[0]
-        self._ik_rot_buffer[0, 1] = lee_rot[1]
-        self._ik_rot_buffer[0, 2] = lee_rot[2]
-        self._ik_rot_buffer[0, 3] = lee_rot[3]
-        self.l_rot_obj.target_rotations.assign(self._ik_rot_buffer)
-        
-        self._ik_pos_buffer[0, 0] = ree_pos[0]
-        self._ik_pos_buffer[0, 1] = ree_pos[1]
-        self._ik_pos_buffer[0, 2] = ree_pos[2]
-        self.r_pos_obj.target_positions.assign(self._ik_pos_buffer)
-        
-        self._ik_rot_buffer[0, 0] = ree_rot[0]
-        self._ik_rot_buffer[0, 1] = ree_rot[1]
-        self._ik_rot_buffer[0, 2] = ree_rot[2]
-        self._ik_rot_buffer[0, 3] = ree_rot[3]
-        self.r_rot_obj.target_rotations.assign(self._ik_rot_buffer)
-        
-        # CRITICAL FIX: Update gizmo transforms to clamped values
-        # This prevents the "chasing" problem where the robot can never catch up
-        # to a distant gizmo target. By updating gizmo to the clamped position,
-        # the next frame will continue from this position rather than trying to
-        # reach the original far-away target.
-        self.gizmo_lee_tf = clamped_lee_tf
-        self.gizmo_ree_tf = clamped_ree_tf
-        
-        # Update previous transforms for next frame
-        self.prev_gizmo_lee_tf = clamped_lee_tf
-        self.prev_gizmo_ree_tf = clamped_ree_tf
-
-        if hasattr(self.viewer, "is_key_down"):
-            if self.viewer.is_key_down("1"):
-                self.open_left_gripper -= 0.1
-            else:
-                self.open_left_gripper += 0.1
-
-            if self.viewer.is_key_down("2"):
-                self.open_right_gripper -= 0.1
-            else:
-                self.open_right_gripper += 0.1
-            self.open_left_gripper = np.clip(self.open_left_gripper, 0.0, 1.0)
-            self.open_right_gripper = np.clip(self.open_right_gripper, 0.0, 1.0)
-            # Commented out for better performance (avoids CPU-GPU sync)
-            # print(f"Open left gripper: {self.open_left_gripper}, Open right gripper: {self.open_right_gripper}")
-            # print(f"Left gripper state: {self.left_gripper_state}, Right gripper state: {self.right_gripper_state}")
-
-        # Commented out for better performance
-        # print(f"Left  end effector (clamped):{clamped_lee_tf}")
-        # print(f"Right end effector (clamped):{clamped_ree_tf}")
 
     def _interpolate_transform(self, tf_start, tf_end, alpha):
         """Interpolate between two transforms using alpha in [0, 1].
