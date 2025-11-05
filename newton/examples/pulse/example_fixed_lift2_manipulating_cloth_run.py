@@ -1534,8 +1534,8 @@ class Example:
             self.cached_ree_target_tf = target_ree_tf
             
             # Update gizmo positions to match queue execution
-            self.gizmo_lee_tf = wp.transform(lee_pos, lee_rot)
-            self.gizmo_ree_tf = wp.transform(ree_pos, ree_rot)
+            # self.gizmo_lee_tf = wp.transform(lee_pos, lee_rot)
+            # self.gizmo_ree_tf = wp.transform(ree_pos, ree_rot)
             
             # Advance queue index
             self.queue_index += 1
