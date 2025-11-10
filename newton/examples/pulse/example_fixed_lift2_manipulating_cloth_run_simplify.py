@@ -876,6 +876,34 @@ class Example:
     def ik_simulate(self):
         self.solver.solve(iterations=self.ik_iters)
 
+    def _update_gripper_collision_filtering_cpu(self):
+        left_opening = float(self.left_gripper_state) < float(self.open_left_gripper)
+        right_opening = float(self.right_gripper_state) < float(self.open_right_gripper)
+        
+        # 获取shape_flags的numpy视图
+        shape_flags_np = self.model.shape_flags.numpy()
+        
+        # 更新左侧gripper的碰撞标志
+        for shape_id in self.left_gripper_shape_ids:
+            if left_opening:
+                # Opening/releasing: disable collision
+                shape_flags_np[shape_id] = shape_flags_np[shape_id] & ~self.COLLIDE_PARTICLES
+            else:
+                # Closed/maintaining: enable collision
+                shape_flags_np[shape_id] = shape_flags_np[shape_id] | self.COLLIDE_PARTICLES
+        
+        # 更新右侧gripper的碰撞标志
+        for shape_id in self.right_gripper_shape_ids:
+            if right_opening:
+                # Opening/releasing: disable collision
+                shape_flags_np[shape_id] = shape_flags_np[shape_id] & ~self.COLLIDE_PARTICLES
+            else:
+                # Closed/maintaining: enable collision
+                shape_flags_np[shape_id] = shape_flags_np[shape_id] | self.COLLIDE_PARTICLES
+        
+        # 将修改后的flags同步回GPU（如果在GPU上）
+        self.model.shape_flags.assign(shape_flags_np)
+
     def _update_gripper_collision_filtering(self):
         """动态更新gripper碰撞过滤：只在夹爪松开过程中禁用碰撞（GPU版本）。
         
@@ -1192,8 +1220,10 @@ class Example:
         self.gripper_params_wp.assign(gripper_params_host)
 
         # 动态更新gripper碰撞过滤（在physics simulation之前执行一次）
-        # 松开时禁用碰撞，GPU版本，兼容CUDA graph
-        self._update_gripper_collision_filtering()
+        # 松开时禁用碰撞
+        # 使用GPU版本（兼容CUDA graph capture）：
+        # self._update_gripper_collision_filtering()
+        self._update_gripper_collision_filtering_cpu()
 
         # Physics step for all substeps (loop is inside physics_simulate for CUDA graph)
         if self.physics_graph:
