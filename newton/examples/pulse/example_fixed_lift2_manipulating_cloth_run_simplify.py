@@ -45,19 +45,23 @@ def _update_control_kernel(
     # Asymmetric openness rule:
     # - 0 -> 1: switch immediately (no interpolation)
     # - 1 -> 0: interpolate linearly over substeps
-    if left_prev < left_target:
-        left_open = left_target
-    elif left_prev > left_target:
-        left_open = (1.0 - t) * left_prev + t * left_target
-    else:
-        left_open = left_prev
+    # if left_prev < left_target:
+    #     left_open = left_target
+    # elif left_prev > left_target:
+    #     left_open = (1.0 - t) * left_prev + t * left_target
+    # else:
+    #     left_open = left_prev
 
-    if right_prev < right_target:
-        right_open = right_target
-    elif right_prev > right_target:
-        right_open = (1.0 - t) * right_prev + t * right_target
-    else:
-        right_open = right_prev
+    # if right_prev < right_target:
+    #     right_open = right_target
+    # elif right_prev > right_target:
+    #     right_open = (1.0 - t) * right_prev + t * right_target
+    # else:
+    #     right_open = right_prev
+
+    left_open = (1.0 - t) * left_prev + t * left_target
+    right_open = (1.0 - t) * right_prev + t * right_target
+
 
     if gripper_control_type == 1:
         if tid < left_count:
@@ -129,6 +133,44 @@ def _update_control_kernel(
         state_qd[ci] = v_c
 
 
+@wp.kernel
+def _update_gripper_collision_kernel(
+    shape_flags: wp.array(dtype=int),
+    left_gripper_shapes: wp.array(dtype=int),
+    right_gripper_shapes: wp.array(dtype=int),
+    left_shape_count: int,
+    right_shape_count: int,
+    left_opening: int,  # 0=closed/maintain, 1=opening (releasing)
+    right_opening: int,  # 0=closed/maintain, 1=opening (releasing)
+    collide_particles_flag: int,
+):
+    """GPU kernel to update gripper collision flags.
+    
+    When gripper is opening/releasing (state < target), disable collision.
+    When gripper is closed/maintaining (state >= target), enable collision.
+    """
+    tid = wp.tid()
+    
+    # Update left gripper shapes
+    if tid < left_shape_count:
+        shape_id = left_gripper_shapes[tid]
+        if left_opening == 1:
+            # Opening/releasing: disable collision
+            shape_flags[shape_id] = shape_flags[shape_id] & ~collide_particles_flag
+        else:
+            # Closed/maintaining: enable collision
+            shape_flags[shape_id] = shape_flags[shape_id] | collide_particles_flag
+    
+    # Update right gripper shapes
+    if tid < right_shape_count:
+        shape_id = right_gripper_shapes[tid]
+        if right_opening == 1:
+            # Opening/releasing: disable collision
+            shape_flags[shape_id] = shape_flags[shape_id] & ~collide_particles_flag
+        else:
+            # Closed/maintaining: enable collision
+            shape_flags[shape_id] = shape_flags[shape_id] | collide_particles_flag
+
 
 class GripperControlType(IntEnum):
     """
@@ -144,25 +186,6 @@ class GripperControlType(IntEnum):
     TARGET_VELOCITY = 2
     """Control the gripper finger by setting the target velocity."""
 
-class AnimationType(IntEnum):
-    """
-    Flags for robot animation controlling.
-    """
-
-    INTERACTIVE = 0
-    """Interactive control with gizmo."""
-
-    TRAJECTORY = 1
-    """Trajectory control."""
-
-    INTERACTIVE_QUEUE = 2
-    """Interactive control with gizmo, splits motion into 30 steps."""
-
-    INTERACTIVE_NO_QUEUE = 3
-    """Interactive control with gizmo, no queue (direct response with optimizations)."""
-
-    QUEUE_NO_CLAMP = 4
-    """Interactive control with gizmo and queue, but without displacement clamping."""
 
 # config the joint types
 fixed_joint_names = {
@@ -249,7 +272,6 @@ class Example:
         # 2. Command-Line Arguments
         # ═══════════════════════════════════════════════════════════════════════════
         self.gripper_control_type = GripperControlType(args.gripper_control_type)
-        self.animation_type = AnimationType(args.animation_type)
         self.use_mujoco_cpu = args.use_mujoco_cpu
         self.sim_vbd_iterations = args.vbd_iterations
         self.trajectory_queue_size = args.trajectory_queue_size
@@ -302,6 +324,11 @@ class Example:
         self.model.soft_contact_ke = self.soft_contact_ke
         self.model.soft_contact_kd = self.soft_contact_kd
         self.model.soft_contact_mu = self.self_contact_friction
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 9. Setup Contact Filtering (disable collisions for robot except grippers)
+        # ═══════════════════════════════════════════════════════════════════════════
+        self._setup_contact_filtering()
 
         # ═══════════════════════════════════════════════════════════════════════════
         # 10. Initialize GPU Buffers and Compute Graphs
@@ -400,7 +427,13 @@ class Example:
             enable_self_collisions=False,
             xform=wp.transform(p=wp.vec3(0.0, 0.0, self.ROBOT_BASE_HEIGHT))
         )
-        franka.add_ground_plane()
+        
+        # Add ground plane with explicit collision configuration
+        ground_cfg = newton.ModelBuilder.ShapeConfig(
+            has_particle_collision=True,  # 显式启用与布料的碰撞
+            has_shape_collision=True,
+        )
+        franka.add_ground_plane(cfg=ground_cfg)
         
         return franka
     
@@ -501,15 +534,21 @@ class Example:
         Args:
             builder: ModelBuilder instance
         """
-        # Add fixed table
+        # Add fixed table with explicit collision configuration
         body_table = builder.add_body()
         builder.add_joint_fixed(-1, body_table)
+        table_cfg = newton.ModelBuilder.ShapeConfig(
+            mu=self.table_friction,
+            has_particle_collision=True,  # 显式启用与布料的碰撞
+            has_shape_collision=True,
+        )
         builder.add_shape_box(
             body_table,
             xform=wp.transform(p=self.TABLE_POS, q=wp.quat_identity()),
             hx=self.TABLE_SIZE[0],
             hy=self.TABLE_SIZE[1],
-            hz=self.TABLE_SIZE[2]
+            hz=self.TABLE_SIZE[2],
+            cfg=table_cfg
         )
 
         # # Add movable box
@@ -554,6 +593,64 @@ class Example:
             particle_radius=self.cloth_particle_radius,
         )
     
+    def _setup_contact_filtering(self):
+        """准备动态碰撞过滤所需的数据结构。
+        
+        收集gripper和end-effector(fl_link6, fr_link6)的shape IDs。
+        所有碰撞控制都在运行时根据夹爪状态动态进行。
+        """
+        joint_child_np = self.model.joint_child.numpy()
+        COLLIDE_PARTICLES = 1 << 2  # ShapeFlags.COLLIDE_PARTICLES
+        
+        def _collect_shape_ids_from_joints(joint_name_set):
+            """收集指定joint名称集合对应的shape IDs。"""
+            bodies = [int(joint_child_np[i]) for i, key in enumerate(self.model.joint_key) if key in joint_name_set]
+            shape_ids = set()
+            for body_id in bodies:
+                if body_id in self.model.body_shapes:
+                    shape_ids.update(int(shape_id) for shape_id in self.model.body_shapes[body_id])
+            return shape_ids
+        
+        def _collect_shape_ids_from_bodies(body_name_set):
+            """收集指定body名称集合对应的shape IDs。"""
+            bodies = [i for i, key in enumerate(self.model.body_key) if key in body_name_set]
+            shape_ids = set()
+            for body_id in bodies:
+                if body_id in self.model.body_shapes:
+                    shape_ids.update(int(shape_id) for shape_id in self.model.body_shapes[body_id])
+            return shape_ids
+
+        # 收集左右gripper的shapes（包括末端执行器）
+        left_gripper_shapes = _collect_shape_ids_from_joints(left_gripper_joint_names)
+        left_ee_shapes = _collect_shape_ids_from_bodies(left_ee_body_names)
+        left_shapes_combined = left_gripper_shapes | left_ee_shapes  # 合并两个集合
+        
+        right_gripper_shapes = _collect_shape_ids_from_joints(right_gripper_joint_names)
+        right_ee_shapes = _collect_shape_ids_from_bodies(right_ee_body_names)
+        right_shapes_combined = right_gripper_shapes | right_ee_shapes  # 合并两个集合
+
+        # 转换为numpy数组
+        if left_shapes_combined:
+            self.left_gripper_shape_ids = np.array(sorted(left_shapes_combined), dtype=np.int32)
+        else:
+            self.left_gripper_shape_ids = np.zeros((0,), dtype=np.int32)
+            
+        if right_shapes_combined:
+            self.right_gripper_shape_ids = np.array(sorted(right_shapes_combined), dtype=np.int32)
+        else:
+            self.right_gripper_shape_ids = np.zeros((0,), dtype=np.int32)
+        
+        self.COLLIDE_PARTICLES = COLLIDE_PARTICLES
+        
+        print(f"\n=== Contact Filtering配置完成 ===")
+        print(f"Left gripper shapes (包括fl_link6): {len(self.left_gripper_shape_ids)}, IDs: {self.left_gripper_shape_ids.tolist()}")
+        print(f"  - from gripper joints: {sorted(left_gripper_shapes)}")
+        print(f"  - from fl_link6 body: {sorted(left_ee_shapes)}")
+        print(f"Right gripper shapes (包括fr_link6): {len(self.right_gripper_shape_ids)}, IDs: {self.right_gripper_shape_ids.tolist()}")
+        print(f"  - from gripper joints: {sorted(right_gripper_shapes)}")
+        print(f"  - from fr_link6 body: {sorted(right_ee_shapes)}")
+        print(f"动态碰撞过滤：在夹爪松开过程中禁用gripper和end-effector碰撞")
+    
     def _init_gpu_buffers(self):
         """Initialize GPU buffers for control and IK."""
         self.left_gripper_joint_indices_wp = wp.array(
@@ -568,6 +665,14 @@ class Example:
         self.q0_frame_wp = wp.zeros(self.model.joint_coord_count, dtype=float, device=self.model.device)
         self.q_target_frame_wp = wp.zeros(self.model.joint_coord_count, dtype=float, device=self.model.device)
         self.gripper_params_wp = wp.zeros(4, dtype=float, device=self.model.device)
+        
+        # GPU buffers for collision filtering
+        self.left_gripper_shape_ids_wp = wp.array(
+            self.left_gripper_shape_ids, dtype=int, device=self.model.device
+        )
+        self.right_gripper_shape_ids_wp = wp.array(
+            self.right_gripper_shape_ids, dtype=int, device=self.model.device
+        )
     
     def _setup_viewer(self):
         """Configure viewer settings."""
@@ -771,6 +876,47 @@ class Example:
     def ik_simulate(self):
         self.solver.solve(iterations=self.ik_iters)
 
+    def _update_gripper_collision_filtering(self):
+        """动态更新gripper碰撞过滤：只在夹爪松开过程中禁用碰撞（GPU版本）。
+        
+        规则：
+        - 当gripper_state < open_gripper（正在松开/打开）时，禁用夹爪碰撞
+        - 当gripper_state >= open_gripper（已关闭或保持）时，启用夹爪碰撞
+        - 机器人非gripper部分（手臂等）不受影响，保持默认碰撞状态
+        
+        这样做的目的是让夹爪松开时能够穿过衣物，避免碰撞阻碍松开动作。
+        
+        注意：此版本使用GPU kernel，兼容CUDA graph capture。
+        """
+        # 判断gripper状态（state < target 表示正在松开）
+        # 使用当前帧开始时的gripper state和目标值来判断
+        left_opening = 1 if float(self.left_gripper_state) < float(self.open_left_gripper) else 0
+        # left_opening = 1
+        right_opening = 1 if float(self.right_gripper_state) < float(self.open_right_gripper) else 0
+        
+        # 计算kernel launch维度
+        left_count = int(self.left_gripper_shape_ids_wp.shape[0])
+        right_count = int(self.right_gripper_shape_ids_wp.shape[0])
+        dim = max(left_count, right_count)
+        
+        if dim > 0:
+            # 在GPU上更新collision flags
+            wp.launch(
+                kernel=_update_gripper_collision_kernel,
+                dim=dim,
+                inputs=[
+                    self.model.shape_flags,
+                    self.left_gripper_shape_ids_wp,
+                    self.right_gripper_shape_ids_wp,
+                    left_count,
+                    right_count,
+                    left_opening,
+                    right_opening,
+                    self.COLLIDE_PARTICLES,
+                ],
+                device=self.model.device,
+            )
+
     def physics_simulate(self):
         """Run physics simulation for all substeps."""
         for s in range(self.sim_substeps):
@@ -809,8 +955,8 @@ class Example:
                 device=self.model.device,
             )
 
-            # Collide and clear forces; filter gripper contacts if opened
-            self.contacts = self.model.collide(self.state_0)
+            # Collide and clear forces
+            self.contacts = self.model.collide(self.state_0, soft_contact_margin=self.cloth_body_contact_margin)
             self.state_0.clear_forces()
             self.state_1.clear_forces()
 
@@ -826,7 +972,7 @@ class Example:
             self.model.particle_count = particle_count
 
             # Cloth step
-            self.contacts = self.model.collide(self.state_0, soft_contact_margin=self.cloth_body_contact_margin)
+            # self.contacts = self.model.collide(self.state_0, soft_contact_margin=self.cloth_body_contact_margin)
             self.cloth_solver.step(self.state_0, self.state_1, None, self.contacts, self.sim_dt)
 
             # Swap state
@@ -907,8 +1053,8 @@ class Example:
         
         # Check if gizmo has moved significantly
         gizmo_moved = self._has_gizmo_moved(threshold_pos=0.001)
-        if gizmo_moved:
-            print(f"Gizmo moved (no clamp mode): {gizmo_moved}!!!!")
+        # if gizmo_moved:
+            # print(f"Gizmo moved (no clamp mode): {gizmo_moved}!!!!")
 
         if gizmo_moved:
             # Use gizmo positions directly without clamping
@@ -1017,11 +1163,7 @@ class Example:
             self.left_gripper_state = self.open_left_gripper
             self.right_gripper_state = self.open_right_gripper
 
-        if self.animation_type == AnimationType.INTERACTIVE:
-            self._push_targets_from_gizmos()
-
-        if self.animation_type == AnimationType.QUEUE_NO_CLAMP:
-            self._push_targets_from_gizmos_queue_no_clamp()
+        self._push_targets_from_gizmos_queue_no_clamp()
 
 
         # IK step, update self.ik_joint_q as the target pose
@@ -1049,6 +1191,10 @@ class Example:
         ], dtype=np.float32)
         self.gripper_params_wp.assign(gripper_params_host)
 
+        # 动态更新gripper碰撞过滤（在physics simulation之前执行一次）
+        # 松开时禁用碰撞，GPU版本，兼容CUDA graph
+        self._update_gripper_collision_filtering()
+
         # Physics step for all substeps (loop is inside physics_simulate for CUDA graph)
         if self.physics_graph:
             # print("Launching physics simulation from CUDA graph...")
@@ -1066,8 +1212,6 @@ class Example:
             step_duration = current_time - self.last_step_time
             current_fps = 1.0 / step_duration if step_duration > 0 else 0            
             # Print FPS info (skip frequent printing in GPU-optimized interactive modes for better performance)
-            if self.animation_type not in (AnimationType.INTERACTIVE_QUEUE, AnimationType.INTERACTIVE_NO_QUEUE, AnimationType.QUEUE_NO_CLAMP) or self.sim_frame % 30 == 0:
-                print(f'Frame {self.sim_frame}: FPS = {current_fps:.2f}, Step time = {step_duration*1000:.2f}ms')
         
         self.last_step_time = current_time
         
@@ -1086,41 +1230,14 @@ class Example:
         """Render the current frame."""
         self.viewer.begin_frame(self.sim_time)
 
-        if self.animation_type == AnimationType.INTERACTIVE:
-            # Register gizmo (viewer will draw & mutate transform in-place)
-            # Use gizmo values directly (they represent user input, not interpolated values)
-            # The gizmo transforms are mutated in-place by viewer, so we need to pass the
-            # current gizmo values (which will be updated by user interaction)
-            self.viewer.log_gizmo("left_target_tcp", self.gizmo_lee_tf)
-            self.viewer.log_gizmo("right_target_tcp", self.gizmo_ree_tf)
-        
-        if self.animation_type == AnimationType.INTERACTIVE_QUEUE:
-            # Register gizmo for INTERACTIVE_QUEUE mode
-            # Always accept gizmo input, will create new trajectory when moved
-            self.viewer.log_gizmo("left_target_tcp", self.gizmo_lee_tf)
-            self.viewer.log_gizmo("right_target_tcp", self.gizmo_ree_tf)
-        
-        if self.animation_type == AnimationType.INTERACTIVE_NO_QUEUE:
-            # Register gizmo for INTERACTIVE_NO_QUEUE mode
-            # Direct gizmo control with optimizations
-            self.viewer.log_gizmo("left_target_tcp", self.gizmo_lee_tf)
-            self.viewer.log_gizmo("right_target_tcp", self.gizmo_ree_tf)
-        
-        if self.animation_type == AnimationType.QUEUE_NO_CLAMP:
-            # Register gizmo for QUEUE_NO_CLAMP mode
-            # Queue-based control without displacement clamping
-            self.viewer.log_gizmo("left_target_tcp", self.gizmo_lee_tf)
-            self.viewer.log_gizmo("right_target_tcp", self.gizmo_ree_tf)
+        self.viewer.log_gizmo("left_target_tcp", self.gizmo_lee_tf)
+        self.viewer.log_gizmo("right_target_tcp", self.gizmo_ree_tf)
         
         self.viewer.log_state(self.state_0)
 
         self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
 
-        # Only synchronize for non-GPU-optimized modes
-        # For INTERACTIVE_QUEUE, INTERACTIVE_NO_QUEUE, and QUEUE_NO_CLAMP, rely on implicit synchronization at render time
-        if self.animation_type not in (AnimationType.INTERACTIVE_QUEUE, AnimationType.INTERACTIVE_NO_QUEUE, AnimationType.QUEUE_NO_CLAMP):
-            wp.synchronize()
 
         if self.use_dump_image:
             io_util.dump_gl_frame_image(
@@ -1138,11 +1255,7 @@ if __name__ == "__main__":
     parser.add_argument("--gripper-control-type", type=int, default=1,
                         choices=[0, 1, 2],
                         help="Gripper control: 0=NONE, 1=TARGET_POSITION, 2=TARGET_VELOCITY")
-    
-    parser.add_argument("--animation-type", type=int, default=4,
-                        choices=[0, 1, 2, 3, 4],
-                        help="Animation: 0=INTERACTIVE, 1=TRAJECTORY, 2=INTERACTIVE_QUEUE, 3=INTERACTIVE_NO_QUEUE, 4=QUEUE_NO_CLAMP")
-    
+        
     parser.add_argument("--vbd-iterations", type=int, default=7,
                         help="VBD iterations for cloth simulation")
     
