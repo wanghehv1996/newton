@@ -2,6 +2,7 @@ import warp as wp
 import numpy as np
 from pxr import Usd, UsdGeom
 import time
+import json
 
 import newton
 import newton.examples
@@ -760,59 +761,36 @@ class ParameterViewer:
     
     def _save_parameters_to_json(self):
         """Save all current parameters to a JSON file and print them."""
-        import json
         from datetime import datetime
         
-        # Collect all parameters
-        params = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "performance": {
-                "fps": self.example.fps,
-                "frame_dt": self.example.frame_dt,
-                "sim_substeps": self.example.sim_substeps,
-                "sim_dt": self.example.sim_dt,
-            },
-            "cloth_properties": {
-                "cloth_density": self.example.CLOTH_DENSITY,
-            },
-            "contact_parameters": {
-                "cloth_particle_radius": self.example.cloth_particle_radius,
-                "cloth_body_contact_margin": self.example.cloth_body_contact_margin,
-                "self_contact_radius": self.example.self_contact_radius,
-                "self_contact_margin": self.example.self_contact_margin,
-                "self_contact_friction": self.example.self_contact_friction,
-                "soft_contact_ke": self.example.soft_contact_ke,
-                "soft_contact_kd": self.example.soft_contact_kd,
-            },
-            "cloth_elasticity": {
-                "tri_ke": self.example.tri_ke,
-                "tri_ka": self.example.tri_ka,
-                "tri_kd": self.example.tri_kd,
-                "bending_ke": self.example.bending_ke,
-                "bending_kd": self.example.bending_kd,
-            },
-            "other_parameters": {
-                "robot_friction": self.example.robot_friction,
-                "table_friction": self.example.table_friction,
-                "vbd_iterations": self.example.sim_vbd_iterations,
-            }
-        }
+        # Generate filename with timestamp
+        filename = f"./cloth_sim_config_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         
-        # Print to console
+        # Use Example's save_physics_config method
+        self.example.save_physics_config(filename)
+        
+        # Print current parameters to console
         print("\n" + "="*60)
-        print("📊 Current Simulation Parameters")
+        print("📊 Current Physics Parameters")
         print("="*60)
-        print(json.dumps(params, indent=2))
+        print(f"  Contact Parameters:")
+        print(f"    cloth_particle_radius: {self.example.cloth_particle_radius:.4f}")
+        print(f"    cloth_body_contact_margin: {self.example.cloth_body_contact_margin:.4f}")
+        print(f"    self_contact_radius: {self.example.self_contact_radius:.4f}")
+        print(f"    self_contact_margin: {self.example.self_contact_margin:.4f}")
+        print(f"    self_contact_friction: {self.example.self_contact_friction:.2f}")
+        print(f"    soft_contact_ke: {self.example.soft_contact_ke:.1f}")
+        print(f"    soft_contact_kd: {self.example.soft_contact_kd:.2e}")
+        print(f"  Cloth Elasticity:")
+        print(f"    tri_ke: {self.example.tri_ke:.1f}")
+        print(f"    tri_ka: {self.example.tri_ka:.1f}")
+        print(f"    tri_kd: {self.example.tri_kd:.2e}")
+        print(f"    bending_ke: {self.example.bending_ke:.2e}")
+        print(f"    bending_kd: {self.example.bending_kd:.2e}")
+        print(f"  Other:")
+        print(f"    robot_friction: {self.example.robot_friction:.2f}")
+        print(f"    table_friction: {self.example.table_friction:.2f}")
         print("="*60 + "\n")
-        
-        # Save to file
-        filename = f"simulation_params_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        try:
-            with open(filename, 'w') as f:
-                json.dump(params, f, indent=2)
-            print(f"✅ Parameters saved to: {filename}")
-        except Exception as e:
-            print(f"❌ Error saving parameters: {e}")
     
     def _recapture_physics_graph(self):
         """Recapture the physics CUDA graph and reinitialize collision detection.
@@ -934,7 +912,12 @@ class Example:
         # ═══════════════════════════════════════════════════════════════════════════
         # 3. Physics Parameters
         # ═══════════════════════════════════════════════════════════════════════════
-        self._init_physics_parameters()
+        # Load parameters from config file if specified
+        config_params = None
+        if hasattr(args, 'config_file') and args.config_file:
+            config_params = self._load_physics_config(args.config_file)
+        
+        self._init_physics_parameters(config_params)
         
         self.viewer = viewer
 
@@ -1051,25 +1034,111 @@ class Example:
     # Helper Methods for Initialization
     # ═══════════════════════════════════════════════════════════════════════════
     
-    def _init_physics_parameters(self):
-        """Initialize physics and material parameters."""
-        # Contact parameters
-        self.cloth_particle_radius = 0.008
-        self.cloth_body_contact_margin = 0.01
-        self.self_contact_radius = 0.001
-        self.self_contact_margin = 0.002
-        self.soft_contact_ke = 1000
-        self.soft_contact_kd = 5e-3
-        self.robot_friction = 1.5
-        self.table_friction = 0.25
-        self.self_contact_friction = 1.0
-
-        # Elasticity parameters for cloth
-        self.tri_ke = 1e2
-        self.tri_ka = 1e2
-        self.tri_kd = 1.5e-6
-        self.bending_ke = 1e-4
-        self.bending_kd = 1e-3
+    def _load_physics_config(self, config_file):
+        """Load physics parameters from a JSON configuration file.
+        
+        Args:
+            config_file: Path to JSON configuration file
+            
+        Returns:
+            Dictionary of parameter values
+        """
+        try:
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+            print(f"✓ Successfully loaded configuration from: {config_file}")
+            return config.get('physics_parameters', {})
+        except FileNotFoundError:
+            print(f"⚠ Warning: Configuration file not found: {config_file}")
+            print(f"  Using default parameters instead.")
+            return {}
+        except json.JSONDecodeError as e:
+            print(f"⚠ Warning: Failed to parse JSON in {config_file}: {e}")
+            print(f"  Using default parameters instead.")
+            return {}
+        except Exception as e:
+            print(f"⚠ Warning: Error loading configuration file: {e}")
+            print(f"  Using default parameters instead.")
+            return {}
+    
+    def save_physics_config(self, config_file):
+        """Save current physics parameters to a JSON configuration file.
+        
+        Args:
+            config_file: Path to save the JSON configuration file
+        """
+        params = {
+            'physics_parameters': {
+                # Contact parameters
+                'cloth_particle_radius': float(self.cloth_particle_radius),
+                'cloth_body_contact_margin': float(self.cloth_body_contact_margin),
+                'self_contact_radius': float(self.self_contact_radius),
+                'self_contact_margin': float(self.self_contact_margin),
+                'soft_contact_ke': float(self.soft_contact_ke),
+                'soft_contact_kd': float(self.soft_contact_kd),
+                'robot_friction': float(self.robot_friction),
+                'table_friction': float(self.table_friction),
+                'self_contact_friction': float(self.self_contact_friction),
+                # Elasticity parameters for cloth
+                'tri_ke': float(self.tri_ke),
+                'tri_ka': float(self.tri_ka),
+                'tri_kd': float(self.tri_kd),
+                'bending_ke': float(self.bending_ke),
+                'bending_kd': float(self.bending_kd),
+            },
+            'metadata': {
+                'description': 'Physics parameters for cloth simulation',
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'fps': self.fps,
+                'sim_substeps': self.sim_substeps,
+                'vbd_iterations': self.sim_vbd_iterations,
+            }
+        }
+        
+        try:
+            with open(config_file, 'w') as f:
+                json.dump(params, f, indent=4)
+            print(f"✓ Successfully saved configuration to: {config_file}")
+        except Exception as e:
+            print(f"⚠ Error: Failed to save configuration file: {e}")
+    
+    def _init_physics_parameters(self, config_params=None):
+        """Initialize physics and material parameters.
+        
+        Args:
+            config_params: Optional dictionary of parameters loaded from config file
+        """
+        # Default parameters
+        defaults = {
+            # Contact parameters
+            'cloth_particle_radius': 0.008,
+            'cloth_body_contact_margin': 0.01,
+            'self_contact_radius': 0.001,
+            'self_contact_margin': 0.002,
+            'soft_contact_ke': 1000.0,
+            'soft_contact_kd': 5e-3,
+            'robot_friction': 1.5,
+            'table_friction': 0.25,
+            'self_contact_friction': 1.0,
+            # Elasticity parameters for cloth
+            'tri_ke': 1e2,
+            'tri_ka': 1e2,
+            'tri_kd': 1.5e-6,
+            'bending_ke': 1e-4,
+            'bending_kd': 1e-3,
+        }
+        
+        # Override defaults with config file values if provided
+        if config_params:
+            print(f"Loading physics parameters from config file:")
+            for key, value in config_params.items():
+                if key in defaults:
+                    defaults[key] = value
+                    print(f"  {key}: {value}")
+        
+        # Set all parameters as instance attributes
+        for key, value in defaults.items():
+            setattr(self, key, value)
     
     def _build_robot_model(self):
         """Build the robot model with URDF and ground plane.
@@ -2013,6 +2082,9 @@ if __name__ == "__main__":
     parser.add_argument("--sim-substeps", type=int, default=10,
                         help="Simulation substeps per frame")
     
+    # Physics configuration file
+    parser.add_argument("--config-file", type=str, default=None,
+                        help="JSON configuration file to load physics parameters from")
 
     viewer, args = newton.examples.init(parser)
     example = Example(viewer, args)
