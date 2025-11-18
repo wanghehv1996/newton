@@ -1,0 +1,25 @@
+{
+    "physics_parameters": {
+        "cloth_particle_radius": 0.008,
+        "cloth_body_contact_margin": 0.01,
+        "self_contact_radius": 0.001500000013038516,
+        "self_contact_margin": 0.00279999990016222,
+        "soft_contact_ke": 100.0,
+        "soft_contact_kd": 0.10000000149011612,
+        "robot_friction": 1.5,
+        "table_friction": 0.25,
+        "self_contact_friction": 1.0,
+        "tri_ke": 10.600000381469727,
+        "tri_ka": 100.0,
+        "tri_kd": 1.5e-06,
+        "bending_ke": 0.009999999776482582,
+        "bending_kd": 0.10000000149011612
+    },
+    "metadata": {
+        "description": "Physics parameters for cloth simulation",
+        "timestamp": "2025-11-13 19:01:17",
+        "fps": 60,
+        "sim_substeps": 10,
+        "vbd_iterations": 7
+    }
+}
