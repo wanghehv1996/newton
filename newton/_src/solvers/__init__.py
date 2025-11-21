@@ -20,7 +20,7 @@ from .mujoco import SolverMuJoCo
 from .semi_implicit import SolverSemiImplicit
 from .solver import SolverBase
 from .style3d import SolverStyle3D
-from .vbd import SolverVBD, SolverVBDPulse
+from .vbd import SolverVBD, SolverVBDNew, SolverVBDPulse
 from .xpbd import SolverXPBD
 
 __all__ = [
@@ -32,6 +32,7 @@ __all__ = [
     "SolverSemiImplicit",
     "SolverStyle3D",
     "SolverVBD",
+    "SolverVBDNew",
     "SolverVBDPulse",
     "SolverXPBD",
 ]

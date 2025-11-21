@@ -15,8 +15,10 @@
 
 from .solver_vbd import SolverVBD
 from .solver_vbd_pulse import SolverVBDPulse
+from .solver_vbd_new import SolverVBDNew
 
 __all__ = [
     "SolverVBD",
+    "SolverVBDNew",
     "SolverVBDPulse"
 ]
